@@ -14,7 +14,7 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["server/**/*.test.ts", "server/**/*.spec.ts"],
+    include: ["server/**/*.test.ts", "server/**/*.spec.ts", "client/**/*.test.ts", "client/**/*.test.tsx"],
     // Live Besu contract/adapter tests deploy their own contracts and wait
     // for QBFT block inclusion; run files sequentially to keep timings stable.
     fileParallelism: false,
