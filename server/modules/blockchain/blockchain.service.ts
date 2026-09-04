@@ -1,64 +1,82 @@
-import { randomUUID } from "node:crypto";
-
 /**
- * Mock blockchain adapter.
+ * SAMPRAAN blockchain service facade.
  *
- * Deliberately reports connected: false / mode: "MOCK" so no caller can mistake
- * this for a real Hyperledger Besu network. Real Besu integration is a later
- * SAMPRAAN phase and must replace this adapter without changing its surface.
+ * Preserves the single `blockchainService` surface the routers and health
+ * endpoints already consume, while routing to the REAL Besu adapter when
+ * configuration is present and to the mock otherwise.
+ *
+ * Design rules:
+ *  - The exported `blockchainService` is a union facade: NetworkStatus.mode
+ *    tells callers exactly which backend answered ("BESU" vs "MOCK").
+ *  - When Besu is NOT configured, mutating chain operations throw a clear
+ *    configuration error instead of silently faking success.
+ *  - The mock remains available for unit tests and CI without a chain.
  */
+import { BesuBlockchainService } from "./besu-blockchain.service";
+import { MockBlockchainService } from "./mock-blockchain.service";
+import { resolveBlockchainConfig } from "./blockchain.config";
+import type {
+  BlockchainOperationInput,
+  ChainEvent,
+  NetworkStatus,
+  TransactionEvidence,
+} from "./blockchain.types";
 
-export interface NetworkStatus {
-  connected: boolean;
-  mode: "MOCK";
-  network: string;
-  latestBlock: number;
-}
+export type BlockchainServiceLike = {
+  getNetworkStatus(): Promise<NetworkStatus>;
+  getLatestBlock(): Promise<number>;
+  submitTransaction(input: BlockchainOperationInput): Promise<TransactionEvidence>;
+  getTransaction(transactionHash: string): Promise<TransactionEvidence | null>;
+  getEvents(input?: { fromBlock?: number; toBlock?: number }): Promise<ChainEvent[]>;
+  /** Signing wallet address when a real chain is configured; null in MOCK mode. */
+  readonly operatorAddress: string | null;
+  readonly mode: "BESU" | "MOCK";
+};
 
-export interface MockTransaction {
-  transactionHash: string;
-  blockNumber: number;
-  status: "CONFIRMED";
-}
+const config = resolveBlockchainConfig();
 
-export class MockBlockchainService {
-  private block = 18402;
-  private transactions = new Map<string, MockTransaction>();
-
-  async getNetworkStatus(): Promise<NetworkStatus> {
+function createService(): BlockchainServiceLike {
+  if (config.mode === "BESU") {
+    const besu = new BesuBlockchainService(config);
+    const operatorAddress = (() => {
+      try {
+        return besu.operatorAddress;
+      } catch {
+        return null;
+      }
+    })();
     return {
-      connected: false,
-      mode: "MOCK",
-      network: "SAMPRAAN-DEMO-QBFT",
-      latestBlock: this.block,
+      mode: "BESU",
+      operatorAddress,
+      getNetworkStatus: () => besu.getNetworkStatus(),
+      getLatestBlock: () => besu.getLatestBlock(),
+      submitTransaction: input => besu.submitTransaction(input),
+      getTransaction: hash => besu.getTransaction(hash),
+      getEvents: input => besu.getEvents(input),
     };
   }
-
-  async getLatestBlock(): Promise<number> {
-    return this.block;
-  }
-
-  async submitTransaction(_input: {
-    action: string;
-    payload: unknown;
-  }): Promise<MockTransaction> {
-    const transactionHash = `0xmock_${randomUUID().replaceAll("-", "")}`;
-    const transaction: MockTransaction = {
-      transactionHash,
-      blockNumber: ++this.block,
-      status: "CONFIRMED",
-    };
-    this.transactions.set(transactionHash, transaction);
-    return transaction;
-  }
-
-  async getTransaction(transactionHash: string): Promise<MockTransaction | null> {
-    return this.transactions.get(transactionHash) ?? null;
-  }
-
-  async getEvents(): Promise<unknown[]> {
-    return [];
-  }
+  const mock = new MockBlockchainService();
+  return {
+    mode: "MOCK",
+    operatorAddress: null,
+    getNetworkStatus: () => mock.getNetworkStatus(),
+    getLatestBlock: () => mock.getLatestBlock(),
+    submitTransaction: input => mock.submitTransaction(input),
+    getTransaction: hash => mock.getTransaction(hash),
+    getEvents: () => mock.getEvents(),
+  };
 }
 
-export const blockchainService = new MockBlockchainService();
+export const blockchainService: BlockchainServiceLike = createService();
+
+// Full typed surface for callers that specifically want the Besu adapter
+// (identity/asset operations beyond the legacy facade).
+export const besuBlockchainService: BesuBlockchainService | null =
+  config.mode === "BESU" ? new BesuBlockchainService(config) : null;
+
+export type {
+  BlockchainOperationInput,
+  ChainEvent,
+  NetworkStatus,
+  TransactionEvidence,
+} from "./blockchain.types";

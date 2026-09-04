@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MockBlockchainService } from "./blockchain.service";
+import { MockBlockchainService } from "./mock-blockchain.service";
 
 describe("MockBlockchainService", () => {
   it("does not claim a real Besu connection", async () => {

@@ -1,0 +1,133 @@
+# SAMPRAAN local permissioned Besu QBFT network (DEMO/LOCAL ONLY).
+#
+# 4 QBFT validators, deterministic configuration, one RPC endpoint on
+# http://localhost:8545 (validator-1). Chain ID: 4224.
+#
+# Start:  docker compose -f blockchain/network/docker-compose.yml up -d
+# Stop:   docker compose -f blockchain/network/docker-compose.yml down
+# Reset:  docker compose -f blockchain/network/docker-compose.yml down -v
+#         then delete blockchain/network/nodedata/* (runtime data, gitignored)
+#
+# Validator keys under blockchain/network/generated/keys were produced by
+# `besu operator generate-blockchain-config` from qbftConfigFile.json and are
+# DEV-ONLY. Never reuse them on any real network.
+services:
+  validator-1:
+    image: hyperledger/besu:25.10.0
+    container_name: sampraan-validator-1
+    command:
+      - "--config-file=/config/config.toml"
+      - "--static-nodes-file=/config/static-nodes.json"
+      - "--genesis-file=/genesis/genesis.json"
+      - "--data-path=/data"
+      - "--node-private-key-file=/keys/0x0a7deed05a87dec40c18f4ed2a5934f7e3efe3c6/key"
+      - "--min-gas-price=0"
+      - "--rpc-http-enabled=true"
+      - "--rpc-http-host=0.0.0.0"
+      - "--rpc-http-port=8545"
+      - "--rpc-http-cors-origins=http://localhost:3000,http://127.0.0.1:3000"
+      - "--rpc-http-api=ETH,NET,WEB3,QBFT,PERM,TRACE,DEBUG"
+      - "--rpc-ws-enabled=true"
+      - "--rpc-ws-host=0.0.0.0"
+      - "--rpc-ws-port=8546"
+      - "--host-allowlist=*"
+      - "--logging=INFO"
+    volumes:
+      - ./generated/genesis.json:/genesis/genesis.json:ro
+      - ./generated/keys:/keys:ro
+      - ./config/config-validator-1.toml:/config/config.toml:ro
+      - ./config/static-nodes.json:/config/static-nodes.json:ro
+      - nodedata-1:/data
+    ports:
+      - "8545:8545"
+      - "8546:8546"
+      - "30303:30303"
+    networks:
+      sampraan-chain:
+        ipv4_address: 172.28.0.11
+
+  validator-2:
+    image: hyperledger/besu:25.10.0
+    container_name: sampraan-validator-2
+    command:
+      - "--config-file=/config/config.toml"
+      - "--static-nodes-file=/config/static-nodes.json"
+      - "--genesis-file=/genesis/genesis.json"
+      - "--data-path=/data"
+      - "--node-private-key-file=/keys/0xc9780250d49a66078fa3042eb4351dfd02357d79/key"
+      - "--min-gas-price=0"
+      - "--host-allowlist=*"
+      - "--logging=INFO"
+    volumes:
+      - ./generated/genesis.json:/genesis/genesis.json:ro
+      - ./generated/keys:/keys:ro
+      - ./config/config-validator-2.toml:/config/config.toml:ro
+      - ./config/static-nodes.json:/config/static-nodes.json:ro
+      - nodedata-2:/data
+    ports:
+      - "30304:30303"
+    networks:
+      sampraan-chain:
+        ipv4_address: 172.28.0.12
+
+  validator-3:
+    image: hyperledger/besu:25.10.0
+    container_name: sampraan-validator-3
+    command:
+      - "--config-file=/config/config.toml"
+      - "--static-nodes-file=/config/static-nodes.json"
+      - "--genesis-file=/genesis/genesis.json"
+      - "--data-path=/data"
+      - "--node-private-key-file=/keys/0x44ca9a599e857cad41326bc63fefcff543c29b57/key"
+      - "--min-gas-price=0"
+      - "--host-allowlist=*"
+      - "--logging=INFO"
+    volumes:
+      - ./generated/genesis.json:/genesis/genesis.json:ro
+      - ./generated/keys:/keys:ro
+      - ./config/config-validator-3.toml:/config/config.toml:ro
+      - ./config/static-nodes.json:/config/static-nodes.json:ro
+      - nodedata-3:/data
+    ports:
+      - "30305:30303"
+    networks:
+      sampraan-chain:
+        ipv4_address: 172.28.0.13
+
+  validator-4:
+    image: hyperledger/besu:25.10.0
+    container_name: sampraan-validator-4
+    command:
+      - "--config-file=/config/config.toml"
+      - "--static-nodes-file=/config/static-nodes.json"
+      - "--genesis-file=/genesis/genesis.json"
+      - "--data-path=/data"
+      - "--node-private-key-file=/keys/0x7c11decf7c5db70e177ce438cbf3bc0b7e140e62/key"
+      - "--min-gas-price=0"
+      - "--host-allowlist=*"
+      - "--logging=INFO"
+    volumes:
+      - ./generated/genesis.json:/genesis/genesis.json:ro
+      - ./generated/keys:/keys:ro
+      - ./config/config-validator-4.toml:/config/config.toml:ro
+      - ./config/static-nodes.json:/config/static-nodes.json:ro
+      - nodedata-4:/data
+    ports:
+      - "30306:30303"
+    networks:
+      sampraan-chain:
+        ipv4_address: 172.28.0.14
+
+networks:
+  sampraan-chain:
+    name: sampraan-chain
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  nodedata-1:
+  nodedata-2:
+  nodedata-3:
+  nodedata-4:

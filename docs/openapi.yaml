@@ -51,7 +51,7 @@ paths:
   /api/trpc/assets.authorizeTransfer:
     post:
       summary: Evaluate a protected asset transfer
-      description: The backend resolves the authenticated actor and its SAMPRAAN identity, derives roles/permissions server-side (client-supplied classification is never trusted), evaluates policy, records the decision and audit event, and only submits a mock chain transaction after ALLOW.
+      description: The backend resolves the authenticated actor and its SAMPRAAN identity (roles/permissions derived server-side; client-supplied classification and step-up are never trusted), evaluates policy, records the decision and audit event, and submits the custody transfer to the permissioned Besu chain after ALLOW. The smart contract independently re-verifies role, identity status, and asset state; on-chain success attaches transactionHash/blockNumber/blockHash evidence to the audit event, and a chain rejection records BLOCKCHAIN_TRANSACTION_FAILED without claiming success.
       security: [{ sessionCookie: [] }]
       requestBody:
         required: true
@@ -80,9 +80,35 @@ paths:
         '200': { description: Security alerts }
   /api/trpc/blockchain.status:
     get:
-      summary: Read blockchain adapter status
+      summary: Read blockchain adapter status (BESU or MOCK)
       responses:
-        '200': { description: MOCK / NOT CONNECTED until Besu is implemented }
+        '200': { description: Network status with mode, chainId, latestBlock, nodeVersion }
+  /api/trpc/blockchain.latestBlock:
+    get:
+      summary: Read the latest chain block number
+      responses:
+        '200': { description: Block number }
+  /api/trpc/blockchain.transaction:
+    get:
+      summary: Retrieve transaction evidence by hash
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - in: query
+          name: input
+          required: true
+          schema:
+            type: object
+            required: [transactionHash]
+            properties:
+              transactionHash: { type: string, pattern: '^0x[0-9a-fA-F]{64}$' }
+      responses:
+        '200': { description: Transaction evidence (hash, blockNumber, blockHash, status, events) }
+  /api/trpc/blockchain.events:
+    get:
+      summary: Read recent SAMPRAAN contract events
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Parsed chain events }
 components:
   securitySchemes:
     sessionCookie:

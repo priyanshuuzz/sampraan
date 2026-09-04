@@ -112,3 +112,13 @@ temp/
 # Manus version file (auto-generated, not part of source)
 client/public/__manus__/version.json
 .project-config.json
+# SAMPRAAN blockchain runtime data (chain state must never be committed)
+blockchain/network/nodedata/
+blockchain/network/*/data/
+**/besu-data/
+**/DATABASE
+**/besu.*/
+
+# Local blockchain env overrides (contain operator private keys)
+blockchain/.env
+blockchain/*.local.env
