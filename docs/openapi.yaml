@@ -1,0 +1,104 @@
+openapi: 3.0.3
+info:
+  title: SAMPRAAN Trust Fabric API
+  version: 0.1.0
+  description: Platform-compatible API contract for the SAMPRAAN backend foundation. Domain calls are currently exposed as typed tRPC procedures under /api/trpc.
+servers:
+  - url: /
+paths:
+  /health:
+    get:
+      summary: API, database, and blockchain adapter status
+      responses:
+        '200':
+          description: Health status
+  /ready:
+    get:
+      summary: Readiness status
+      responses:
+        '200':
+          description: Ready
+        '503':
+          description: Database is not ready
+  /api/trpc/identities.list:
+    get:
+      summary: List identities
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Typed identity list }
+        '401': { description: Authentication required }
+  /api/trpc/identities.create:
+    post:
+      summary: Create an identity
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IdentityInput'
+      responses:
+        '200': { description: Identity created }
+        '400': { description: Validation failure }
+        '401': { description: Authentication required }
+  /api/trpc/assets.list:
+    get:
+      summary: List controlled assets
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Typed asset list }
+        '401': { description: Authentication required }
+  /api/trpc/assets.authorizeTransfer:
+    post:
+      summary: Evaluate a protected asset transfer
+      description: The backend resolves the authenticated actor, evaluates policy, records the decision and audit event, and only submits a mock chain transaction after ALLOW.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferInput'
+      responses:
+        '200': { description: ALLOW, DENY, or CHALLENGE decision }
+        '401': { description: Authentication required }
+        '429': { description: Rate limited }
+  /api/trpc/audit.list:
+    get:
+      summary: List application audit read-model events
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Audit events }
+  /api/trpc/alerts.list:
+    get:
+      summary: List security alerts
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Security alerts }
+  /api/trpc/blockchain.status:
+    get:
+      summary: Read blockchain adapter status
+      responses:
+        '200': { description: MOCK / NOT CONNECTED until Besu is implemented }
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: manus_session
+  schemas:
+    IdentityInput:
+      type: object
+      required: [displayName, organization, did]
+      properties:
+        displayName: { type: string, minLength: 2, maxLength: 160 }
+        organization: { type: string, minLength: 2, maxLength: 180 }
+        did: { type: string, minLength: 8, maxLength: 255 }
+        status: { type: string, enum: [ACTIVE, REVOKED, SUSPENDED] }
+    TransferInput:
+      type: object
+      required: [assetId]
+      properties:
+        assetId: { type: string, format: uuid }
+        assetClassification: { type: string }
+        stepUpAuthenticated: { type: boolean, default: false }
