@@ -3,6 +3,7 @@ import express from "express";
 import { createServer } from "http";
 import net from "net";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
+import { validateSecurityEnv } from "./env";
 import { registerOAuthRoutes } from "./oauth";
 import { registerStorageProxy } from "./storageProxy";
 import { appRouter } from "../routers";
@@ -33,16 +34,25 @@ async function findAvailablePort(startPort: number = 3000): Promise<number> {
 }
 
 async function startServer() {
+  // Fail closed: refuse to boot with an unsafe configuration (e.g. missing
+  // JWT secret in production) rather than silently signing forgeable tokens.
+  validateSecurityEnv();
+
   const app = express();
   const server = createServer(app);
-  // Configure body parser with larger size limit for file uploads
+  // Do not advertise the framework in responses.
+  app.disable("x-powered-by");
   app.use(securityHeaders);
   app.use(corsPolicy);
   app.use(rateLimit());
   app.use(requestLogger);
-  app.use(express.json({ limit: "50mb" }));
-  app.use(express.urlencoded({ limit: "50mb", extended: true }));
+  // Body limits: the API has no legitimate 50 MB payload. A tight cap
+  // prevents trivial memory-exhaustion DoS via large JSON bodies.
+  app.use(express.json({ limit: "1mb" }));
+  app.use(express.urlencoded({ limit: "1mb", extended: true }));
   app.get("/health", async (_req, res) => {
+    // NOTE: intentionally public for liveness probes; returns coarse status
+    // only (no secret material, no stack details).
     const db = await getDb();
     const blockchain = await blockchainService.getNetworkStatus();
     res.json({ api: "OK", database: db ? "CONNECTED" : "NOT_CONFIGURED", blockchain });

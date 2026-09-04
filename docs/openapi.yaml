@@ -92,16 +92,31 @@ components:
   schemas:
     IdentityInput:
       type: object
+      description: Administrative-only (admin role). DID must match did:method:identifier.
       required: [displayName, organization, did]
       properties:
         displayName: { type: string, minLength: 2, maxLength: 160 }
         organization: { type: string, minLength: 2, maxLength: 180 }
-        did: { type: string, minLength: 8, maxLength: 255 }
+        did: { type: string, minLength: 8, maxLength: 255, pattern: '^did:[a-z][a-z0-9]*:[A-Za-z0-9._\-]+$' }
         status: { type: string, enum: [ACTIVE, REVOKED, SUSPENDED] }
     TransferInput:
       type: object
+      description: Only the asset identifier is accepted from the caller. Classification, identity status, role, and step-up state are resolved server-side and can never be asserted by the client.
       required: [assetId]
       properties:
         assetId: { type: string, format: uuid }
-        assetClassification: { type: string }
-        stepUpAuthenticated: { type: boolean, default: false }
+    AssetInput:
+      type: object
+      description: Administrative-only (admin role). Classification is constrained to the engine's enum.
+      required: [assetId, name, type, classification, ownerIdentityId, custodianIdentityId]
+      properties:
+        assetId: { type: string, minLength: 2, maxLength: 120 }
+        name: { type: string, minLength: 2, maxLength: 200 }
+        type: { type: string, minLength: 2, maxLength: 80 }
+        classification: { type: string, enum: [PUBLIC, CONTROLLED, SENSITIVE, HIGHLY_SENSITIVE, CRITICAL] }
+        description: { type: string, maxLength: 5000 }
+        ownerIdentityId: { type: string, format: uuid }
+        custodianIdentityId: { type: string, format: uuid }
+        integrityHash: { type: string, maxLength: 255 }
+        tokenId: { type: string, maxLength: 160 }
+        status: { type: string, enum: [ACTIVE, REVOKED, PENDING] }

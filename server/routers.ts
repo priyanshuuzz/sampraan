@@ -3,7 +3,7 @@ import { TRPCError } from "@trpc/server";
 import { COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
-import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
+import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
 import { authorizationService } from "./modules/authorization/authorization.service";
 import { blockchainService } from "./modules/blockchain/blockchain.service";
 import {
@@ -13,6 +13,7 @@ import {
   createDidRecord,
   createIdentity,
   getAssetById,
+  getIdentityById,
   getIdentityByLinkedUserId,
   getIdentityRolesAndPermissions,
   listAssets,
@@ -23,7 +24,17 @@ import {
 
 const identityStatus = z.enum(["ACTIVE", "REVOKED", "SUSPENDED"]);
 const assetStatus = z.enum(["ACTIVE", "REVOKED", "PENDING"]);
-const assetClassification = z.enum(["PUBLIC", "CONTROLLED", "SENSITIVE", "HIGHLY_SENSITIVE"]);
+// Classifications the authorization engine reasons about. Values outside this
+// set cannot appear in the DB via the API, so POLICY-HIGH-SENS-TRANSFER can
+// never be sidestepped by an ad-hoc classification string.
+const assetClassification = z.enum(["PUBLIC", "CONTROLLED", "SENSITIVE", "HIGHLY_SENSITIVE", "CRITICAL"]);
+// W3C DID Core generic syntax: did:method:name (method = lowercase
+// alphanumeric). Constrained so arbitrary strings can't masquerade as DIDs.
+const did = z
+  .string()
+  .min(8)
+  .max(255)
+  .regex(/^did:[a-z][a-z0-9]*:[A-Za-z0-9._\-]+$/, "Invalid DID format (expected did:method:identifier)")
 
 export const appRouter = router({
   system: systemRouter,
@@ -45,9 +56,10 @@ export const appRouter = router({
   }),
   identities: router({
     list: protectedProcedure.query(() => listIdentities()),
-    create: protectedProcedure.input(z.object({ displayName: z.string().min(2).max(160), organization: z.string().min(2).max(180), did: z.string().min(8).max(255).regex(/^did:[a-z0-9]+:[^\s]+$/, "did must be a valid DID (did:method:identifier)"), status: identityStatus.default("ACTIVE") })).mutation(async ({ input }) => {
-      // REVOKED/SUSPENDED identities must never be created pre-revoked with an
-      // active DID document: force the DID record status to match the identity.
+    // SECURITY: minting identities into the trust registry is an
+    // administrative act — a regular authenticated user must not be able to
+    // create identity records that the authorization engine then trusts.
+    create: adminProcedure.input(z.object({ displayName: z.string().min(2).max(160), organization: z.string().min(2).max(180), did, status: identityStatus.default("ACTIVE") })).mutation(async ({ input }) => {
       const identity = await createIdentity(input).catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
         // identities.did is UNIQUE; a duplicate DID must surface as a clear
@@ -57,6 +69,8 @@ export const appRouter = router({
         }
         throw error;
       });
+      // REVOKED/SUSPENDED identities must never be created pre-revoked with an
+      // active DID document: force the DID record status to match the identity.
       if (!identity) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Identity could not be created" });
       await createDidRecord({
         identityId: identity.id,
@@ -71,7 +85,11 @@ export const appRouter = router({
   }),
   assets: router({
     list: protectedProcedure.query(() => listAssets()),
-    create: protectedProcedure.input(z.object({ assetId: z.string().min(2).max(120), name: z.string().min(2).max(200), type: z.string().min(2).max(80), classification: assetClassification, description: z.string().max(5000).optional(), ownerIdentityId: z.string().uuid(), custodianIdentityId: z.string().uuid(), integrityHash: z.string().max(255).optional(), tokenId: z.string().max(160).optional(), status: assetStatus.default("PENDING") })).mutation(({ input }) => createAsset(input).catch((error: unknown) => {
+    // SECURITY: same reasoning — registering assets (and especially their
+    // classification, which drives POLICY-HIGH-SENS-TRANSFER) is
+    // administrative. Users must not mint low-classification records to
+    // smuggle assets past the transfer policy.
+    create: adminProcedure.input(z.object({ assetId: z.string().min(2).max(120), name: z.string().min(2).max(200), type: z.string().min(2).max(80), classification: assetClassification, description: z.string().max(5000).optional(), ownerIdentityId: z.string().uuid(), custodianIdentityId: z.string().uuid(), integrityHash: z.string().max(255).optional(), tokenId: z.string().max(160).optional(), status: assetStatus.default("PENDING") })).mutation(({ input }) => createAsset(input).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       // assets.assetId is UNIQUE; surface duplicates as a clear client error.
       if (/duplicate entry|ER_DUP_ENTRY/i.test(message)) {
@@ -79,14 +97,10 @@ export const appRouter = router({
       }
       throw error;
     })),
-    authorizeTransfer: protectedProcedure.input(z.object({
-      assetId: z.string().uuid(),
-      // SECURITY: this client-supplied value is IGNORED for policy evaluation.
-      // Classification always comes from the database record. The field stays
-      // in the wire contract (existing clients send it) but is never trusted.
-      assetClassification: z.string().max(80).optional(),
-      stepUpAuthenticated: z.boolean().default(false),
-    })).mutation(async ({ ctx, input }) => {
+    // SECURITY: classification and step-up state come exclusively from
+    // server-side state. The client may only name the asset; it can never
+    // assert its own classification, role, permissions, or step-up state.
+    authorizeTransfer: protectedProcedure.input(z.object({ assetId: z.string().uuid() })).mutation(async ({ ctx, input }) => {
       const asset = await getAssetById(input.assetId);
       if (!asset) throw new TRPCError({ code: "NOT_FOUND", message: "Asset not found" });
 
@@ -97,12 +111,34 @@ export const appRouter = router({
       // SECURITY: resolve the real SAMPRAAN identity linked to the authenticated
       // platform user. The frontend never supplies role/status/permissions —
       // they are derived server-side from the session and the trust domain.
-      // Following the trust-domain pattern, an actor without a registered
-      // SAMPRAAN identity never evaluates as ACTIVE: the engine denies.
+      // An actor without a registered SAMPRAAN identity never evaluates as
+      // ACTIVE: the engine denies.
       const actorIdentity = await getIdentityByLinkedUserId(ctx.user.id);
       const { roles, permissions } = actorIdentity
         ? await getIdentityRolesAndPermissions(actorIdentity.id)
         : { roles: [] as string[], permissions: [] as string[] };
+
+      // SECURITY: the owner identity status is resolved from the database,
+      // never asserted by the caller. An asset whose owner identity is
+      // suspended or revoked (or unknown) cannot be transferred, even when the
+      // actor is an administrator — defense in depth on top of the actor
+      // identity check below.
+      const ownerIdentity = await getIdentityById(asset.ownerIdentityId);
+      const ownerStatus = ownerIdentity?.status ?? "SUSPENDED";
+      if (ownerStatus !== "ACTIVE") {
+        const reason = `Owner identity is ${ownerStatus.toLowerCase()}`;
+        const decision = {
+          decision: "DENY" as const,
+          decisionId: crypto.randomUUID(),
+          reason,
+          policyId: undefined,
+          timestamp: new Date().toISOString(),
+        };
+        // The denial is evidence: persist the audit event with the actor
+        // attribution (never the resource owner) before returning.
+        await createAuditEvent({ actorIdentityId: actorIdentity?.id ?? null, action: "AUTHORIZATION_DENIED", resourceType: "ASSET", resourceId: asset.assetId, decision: "DENY", reason, metadata: { source: "authorization-engine", policyId: null, actorOpenId: ctx.user.openId, actorUserRole: ctx.user.role, actorUserOpenId: ctx.user.openId, actorUserRole: ctx.user.role, ownerStatus } });
+        return { ...decision, transaction: null };
+      }
 
       const result = authorizationService.evaluate({
         identityStatus: actorIdentity?.status ?? "UNREGISTERED",
@@ -112,8 +148,9 @@ export const appRouter = router({
         permissions: ctx.user.role === "admin" ? Array.from(new Set([...permissions, "administration:manage"])) : permissions,
         resourceType: "asset",
         action: "TRANSFER",
+        // SECURITY: classification always comes from the database record,
+        // never from a client-supplied value.
         assetClassification: asset.classification,
-        context: { stepUpAuthenticated: input.stepUpAuthenticated },
       });
 
       // SECURITY: audit and decision records always attribute the ACTOR —
@@ -125,7 +162,11 @@ export const appRouter = router({
       // but the engine's inline policy labels (POLICY-*) are not UUIDs, so
       // they are recorded in the audit metadata instead of the FK column.
       const auditAction = result.decision === "DENY" ? "AUTHORIZATION_DENIED" : result.decision === "CHALLENGE" ? "AUTHORIZATION_CHALLENGED" : "AUTHORIZATION_ALLOWED";
-      const auditMetadata: Record<string, unknown> = { source: "authorization-engine", policyId: result.policyId ?? null, stepUpAuthenticated: input.stepUpAuthenticated, actorOpenId: ctx.user.openId };
+      // SECURITY: audit metadata records BOTH acting-account coordinates
+      // (Manus openId/role) and the actor's SAMPRAAN identity id, so a denial
+      // can never be misattributed to the resource owner.
+      const actingUser = { actorUserOpenId: ctx.user.openId, actorUserRole: ctx.user.role };
+      const auditMetadata: Record<string, unknown> = { source: "authorization-engine", policyId: result.policyId ?? null, actorOpenId: ctx.user.openId, actorUserRole: ctx.user.role, ...actingUser };
 
       if (actorIdentity) {
         await createAuthorizationDecision({
@@ -133,6 +174,7 @@ export const appRouter = router({
           actorIdentityId: actorIdentity.id,
           resourceType: "ASSET",
           resourceId: asset.assetId,
+
           action: "TRANSFER",
           decision: result.decision,
           reason: result.reason,
