@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
   assets,
@@ -6,6 +6,10 @@ import {
   authorizationDecisions,
   identities,
   didRecords,
+  identityRoles,
+  permissions,
+  rolePermissions,
+  roles,
   securityAlerts,
   users,
   type InsertAsset,
@@ -136,6 +140,45 @@ export async function getAssetById(id: string) {
   if (!db) return undefined;
   const rows = await db.select().from(assets).where(eq(assets.id, id)).limit(1);
   return rows[0];
+}
+
+/**
+ * Resolves the SAMPRAAN identity linked to a platform user (Manus auth user id).
+ * Returns undefined when no identity is linked or the database is unavailable.
+ */
+export async function getIdentityByLinkedUserId(linkedUserId: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(identities).where(eq(identities.linkedUserId, linkedUserId)).limit(1);
+  return rows[0];
+}
+
+/**
+ * Resolves the effective SAMPRAAN role names and permission keys granted to an
+ * identity through identity_roles -> role_permissions -> permissions.
+ */
+export async function getIdentityRolesAndPermissions(identityId: string): Promise<{ roles: string[]; permissions: string[] }> {
+  const db = await getDb();
+  if (!db) return { roles: [], permissions: [] };
+
+  const roleRows = await db
+    .select({ roleId: roles.id, roleName: roles.name })
+    .from(identityRoles)
+    .innerJoin(roles, eq(identityRoles.roleId, roles.id))
+    .where(eq(identityRoles.identityId, identityId));
+
+  if (roleRows.length === 0) return { roles: [], permissions: [] };
+
+  const permissionRows = await db
+    .selectDistinct({ key: permissions.key })
+    .from(rolePermissions)
+    .innerJoin(permissions, eq(rolePermissions.permissionId, permissions.id))
+    .where(inArray(rolePermissions.roleId, roleRows.map(row => row.roleId)));
+
+  return {
+    roles: roleRows.map(row => row.roleName),
+    permissions: permissionRows.map(row => row.key),
+  };
 }
 
 export async function createAuthorizationDecision(input: typeof authorizationDecisions.$inferInsert) {

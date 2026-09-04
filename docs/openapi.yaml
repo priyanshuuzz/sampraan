@@ -51,7 +51,7 @@ paths:
   /api/trpc/assets.authorizeTransfer:
     post:
       summary: Evaluate a protected asset transfer
-      description: The backend resolves the authenticated actor, evaluates policy, records the decision and audit event, and only submits a mock chain transaction after ALLOW.
+      description: The backend resolves the authenticated actor and its SAMPRAAN identity, derives roles/permissions server-side (client-supplied classification is never trusted), evaluates policy, records the decision and audit event, and only submits a mock chain transaction after ALLOW.
       security: [{ sessionCookie: [] }]
       requestBody:
         required: true
@@ -61,7 +61,10 @@ paths:
               $ref: '#/components/schemas/TransferInput'
       responses:
         '200': { description: ALLOW, DENY, or CHALLENGE decision }
+        '400': { description: Validation failure }
         '401': { description: Authentication required }
+        '404': { description: Asset not found }
+        '412': { description: Asset is not ACTIVE and cannot be transferred }
         '429': { description: Rate limited }
   /api/trpc/audit.list:
     get:
@@ -85,7 +88,7 @@ components:
     sessionCookie:
       type: apiKey
       in: cookie
-      name: manus_session
+      name: app_session_id
   schemas:
     IdentityInput:
       type: object
