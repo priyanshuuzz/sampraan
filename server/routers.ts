@@ -44,13 +44,31 @@ export const appRouter = router({
       await createAuthorizationDecision({ id: result.decisionId, actorIdentityId: asset.ownerIdentityId, resourceType: "ASSET", resourceId: asset.assetId, action: "TRANSFER", decision: result.decision, reason: result.reason, policyId: result.policyId, timestamp: new Date(result.timestamp) });
       await createAuditEvent({ actorIdentityId: asset.ownerIdentityId, action: result.decision === "DENY" ? "AUTHORIZATION_DENIED" : result.decision === "CHALLENGE" ? "AUTHORIZATION_CHALLENGED" : "AUTHORIZATION_ALLOWED", resourceType: "ASSET", resourceId: asset.assetId, decision: result.decision, reason: result.reason, metadata: { source: "authorization-engine" } });
       if (result.decision !== "ALLOW") return { ...result, transaction: null };
-      const transaction = await blockchainService.submitTransaction({ action: "ASSET_TRANSFER", payload: { assetId: asset.assetId, actor: ctx.user.openId } });
-      return { ...result, transaction };
+      // Policy ALLOWed the request. The smart contract now INDEPENDENTLY
+      // re-verifies role, identity status, and asset state on-chain; only a
+      // successful receipt produces a confirmed transaction record.
+      try {
+        const toCustodianWallet = blockchainService.operatorAddress;
+        if (!toCustodianWallet) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Blockchain operator is not configured" });
+        const transaction = await blockchainService.submitTransaction({ action: "ASSET_TRANSFER", payload: { assetId: asset.assetId, toCustodianWallet, actor: ctx.user.openId } });
+        await createAuditEvent({ actorIdentityId: asset.ownerIdentityId, action: "ASSET_TRANSFERRED", resourceType: "ASSET", resourceId: asset.assetId, decision: "ALLOW", reason: "Custody transfer confirmed on-chain", transactionHash: transaction.transactionHash, blockNumber: transaction.blockNumber, metadata: { source: "blockchain-evidence", blockHash: transaction.blockHash, gasUsed: transaction.gasUsed, chainMode: blockchainService.mode, events: transaction.events } });
+        return { ...result, transaction };
+      } catch (error) {
+        // The chain rejected or reverted the operation: never claim success.
+        const reason = error instanceof Error ? error.message : String(error);
+        await createAuditEvent({ actorIdentityId: asset.ownerIdentityId, action: "BLOCKCHAIN_TRANSACTION_FAILED", resourceType: "ASSET", resourceId: asset.assetId, decision: "DENY", reason, metadata: { source: "blockchain-evidence" } });
+        throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: `Blockchain rejected the transfer: ${reason}` });
+      }
     }),
   }),
   audit: router({ list: protectedProcedure.input(z.object({ limit: z.number().int().min(1).max(200).default(50) }).optional()).query(({ input }) => listAuditEvents(input?.limit ?? 50)) }),
   alerts: router({ list: protectedProcedure.query(() => listSecurityAlerts()) }),
-  blockchain: router({ status: publicProcedure.query(() => blockchainService.getNetworkStatus()), latestBlock: publicProcedure.query(() => blockchainService.getLatestBlock()) }),
+  blockchain: router({
+    status: publicProcedure.query(() => blockchainService.getNetworkStatus()),
+    latestBlock: publicProcedure.query(() => blockchainService.getLatestBlock()),
+    transaction: protectedProcedure.input(z.object({ transactionHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/) })).query(({ input }) => blockchainService.getTransaction(input.transactionHash)),
+    events: protectedProcedure.input(z.object({ fromBlock: z.number().int().min(0).optional(), toBlock: z.number().int().min(0).optional() }).optional()).query(({ input }) => blockchainService.getEvents(input)),
+  }),
 });
 
 export type AppRouter = typeof appRouter;
