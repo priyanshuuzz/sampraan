@@ -1,4 +1,12 @@
 export const COOKIE_NAME = "app_session_id";
+// Session lifetime is deliberately short: it bounds the blast radius of a
+// stolen session token (cookie theft, XSS exfiltration, log leakage) without
+// forcing re-login storms. Rotation is handled by the OAuth flow.
+export const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7; // 7 days
+/**
+ * @deprecated Use SESSION_TTL_MS. Retained only because client template code
+ * re-exports it; do not use in new code.
+ */
 export const ONE_YEAR_MS = 1000 * 60 * 60 * 24 * 365;
 export const AXIOS_TIMEOUT_MS = 30_000;
 export const UNAUTHED_ERR_MSG = 'Please login (10001)';

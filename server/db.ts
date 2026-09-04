@@ -117,6 +117,13 @@ export async function createIdentity(input: Omit<InsertIdentity, "id" | "created
   return rows[0];
 }
 
+export async function getIdentityById(id: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(identities).where(eq(identities.id, id)).limit(1);
+  return rows[0];
+}
+
 export async function listAssets() {
   const db = await getDb();
   return db ? db.select().from(assets).orderBy(desc(assets.createdAt)) : [];
