@@ -151,7 +151,9 @@ export class BesuBlockchainService {
         chainId: this.config.chainId,
         error: error instanceof Error && error.message
           ? error.message
-          : String(error),
+          : error instanceof Error && error.name
+            ? `${error.name}${(error as Error & { code?: unknown }).code ? ` (${(error as Error & { code?: unknown }).code})` : ""}`
+            : String(error),
       };
     }
   }

@@ -9,6 +9,7 @@
  * window of blocks, maps recognized events to audit rows, and skips what it
  * has already indexed (idempotent by transaction hash).
  */
+import { describeError } from "../../common/error-handler";
 import { createAuditEvent, listIndexedChainTxHashes } from "../../db";
 import { besuBlockchainService } from "./blockchain.service";
 import type { ChainEvent } from "./blockchain.types";
@@ -72,7 +73,7 @@ export class ChainEventIndexer {
     } catch (error) {
       // BUG-005/QA #6: a range failure must surface as a clear, actionable
       // error instead of crashing the indexer loop or producing garbage.
-      const reason = error instanceof Error ? error.message : String(error);
+      const reason = describeError(error);
       throw new Error(
         `Chain event scan failed for blocks ${fromBlock}..${latestBlock}: ${reason}`
       );

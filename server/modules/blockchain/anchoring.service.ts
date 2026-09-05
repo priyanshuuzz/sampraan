@@ -30,6 +30,7 @@
  *    instead of pretending an anchor happened.
  */
 import { keccak256, toUtf8Bytes, solidityPacked, Wallet } from "ethers";
+import { describeError } from "../../common/error-handler";
 import { createAuditEvent } from "../../db";
 import { besuBlockchainService } from "./blockchain.service";
 import type { TransactionEvidence } from "./blockchain.types";
@@ -129,7 +130,7 @@ export class AnchoringService {
           walletAddress,
         });
       } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
+        const reason = describeError(error);
         if (isAlreadyRegisteredError(reason)) {
           // Same DID (digest) already anchored — this is an idempotent
           // re-creation in the read model, not a chain failure.
@@ -141,7 +142,7 @@ export class AnchoringService {
       }
       result = { outcome: "ANCHORED", walletAddress, transactionHash: evidence.transactionHash, blockNumber: evidence.blockNumber };
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
+      const reason = describeError(error);
       result = { outcome: "FAILED", reason };
     }
     await persistAnchorAudit({
@@ -179,7 +180,7 @@ export class AnchoringService {
       });
       result = { outcome: "ANCHORED", transactionHash: evidence.transactionHash, blockNumber: evidence.blockNumber };
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
+      const reason = describeError(error);
       if (isAlreadyRegisteredError(reason)) {
         result = { outcome: "SKIPPED", reason: `Asset ${input.assetId} is already anchored on-chain` };
       } else {

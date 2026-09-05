@@ -27,6 +27,7 @@ import {
 } from "./db";
 import { anchoringService, deriveIdentityWallet } from "./modules/blockchain/anchoring.service";
 import { isDuplicateEntryError } from "./modules/db/db-errors";
+import { describeError } from "./common/error-handler";
 
 const identityStatus = z.enum(["ACTIVE", "REVOKED", "SUSPENDED"]);
 const assetStatus = z.enum(["ACTIVE", "REVOKED", "PENDING"]);
@@ -173,7 +174,7 @@ export const appRouter = router({
         } catch (error) {
           anchor = {
             outcome: "FAILED",
-            reason: error instanceof Error ? error.message : String(error),
+            reason: describeError(error),
           };
         }
       }
@@ -250,7 +251,7 @@ export const appRouter = router({
         } catch (error) {
           anchor = {
             outcome: "FAILED",
-            reason: error instanceof Error ? error.message : String(error),
+            reason: describeError(error),
           };
         }
       }
@@ -460,7 +461,7 @@ export const appRouter = router({
         // The chain rejected or reverted the operation: never claim success.
         // The authorization decision is evidence and is recorded alongside a
         // BLOCKCHAIN_TRANSACTION_FAILED audit event with the failure reason.
-        const reason = error instanceof Error ? error.message : String(error);
+        const reason = describeError(error);
         // BUG-032 (race safety): if the custodian moved between our read and
         // the submit, SameAssetStatus() still means "already in the requested
         // custody" — return the honest unchanged state, not an error.
@@ -561,7 +562,7 @@ export const appRouter = router({
       try {
         return await blockchainService.getEvents(input);
       } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
+        const reason = describeError(error);
         throw new TRPCError({ code: "BAD_GATEWAY", message: `Blockchain event query failed: ${reason}` });
       }
     }),
