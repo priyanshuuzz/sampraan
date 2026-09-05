@@ -1,11 +1,30 @@
 import type { CookieOptions, Request } from "express";
 
-const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
-
-function isIpAddress(host: string) {
-  // Basic IPv4 check and IPv6 presence detection.
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return true;
-  return host.includes(":");
+/**
+ * Session cookie policy.
+ *
+ * SameSite=Lax is the secure default: the session cookie is sent on
+ * same-site requests and top-level navigations, but NOT on cross-site
+ * POSTs, which blocks the classic CSRF vector (a foreign site posting to
+ * /api/trpc with the victim cookie). Lax keeps normal OAuth-redirect
+ * top-level GET navigation working.
+ *
+ * SameSite=None is reserved for the one-time OAuth state cookie, which
+ * genuinely must survive a cross-site redirect round-trip to the identity
+ * provider (see oauth.ts); the session cookie never needs it.
+ *
+ * The secure flag follows the transport: true on https or behind a proxy
+ * reporting https via x-forwarded-proto.
+ */
+export function getSessionCookieOptions(
+  req: Request
+): Pick<CookieOptions, "domain" | "httpOnly" | "path" | "sameSite" | "secure"> {
+  return {
+    httpOnly: true,
+    path: "/",
+    sameSite: "lax",
+    secure: isSecureRequest(req),
+  };
 }
 
 function isSecureRequest(req: Request) {
@@ -19,30 +38,4 @@ function isSecureRequest(req: Request) {
     : forwardedProto.split(",");
 
   return protoList.some(proto => proto.trim().toLowerCase() === "https");
-}
-
-export function getSessionCookieOptions(
-  req: Request
-): Pick<CookieOptions, "domain" | "httpOnly" | "path" | "sameSite" | "secure"> {
-  // const hostname = req.hostname;
-  // const shouldSetDomain =
-  //   hostname &&
-  //   !LOCAL_HOSTS.has(hostname) &&
-  //   !isIpAddress(hostname) &&
-  //   hostname !== "127.0.0.1" &&
-  //   hostname !== "::1";
-
-  // const domain =
-  //   shouldSetDomain && !hostname.startsWith(".")
-  //     ? `.${hostname}`
-  //     : shouldSetDomain
-  //       ? hostname
-  //       : undefined;
-
-  return {
-    httpOnly: true,
-    path: "/",
-    sameSite: "none",
-    secure: isSecureRequest(req),
-  };
 }

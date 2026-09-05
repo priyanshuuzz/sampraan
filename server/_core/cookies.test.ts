@@ -9,13 +9,18 @@ function requestWith(
   return { headers, protocol } as unknown as Request;
 }
 
+/**
+ * SECURITY CONTRACT: the session cookie is SameSite=Lax (CSRF-hardened),
+ * httpOnly, path-scoped, and Secure whenever the transport is https.
+ * SameSite=None is reserved for the one-time OAuth state cookie only.
+ */
 describe("getSessionCookieOptions", () => {
   it("marks the cookie secure for an https request", () => {
     const options = getSessionCookieOptions(requestWith({}, "https"));
     expect(options).toEqual({
       httpOnly: true,
       path: "/",
-      sameSite: "none",
+      sameSite: "lax",
       secure: true,
     });
   });
@@ -60,10 +65,18 @@ describe("getSessionCookieOptions", () => {
     expect(options.secure).toBe(true);
   });
 
-  it("always applies httpOnly, path /, and sameSite none", () => {
+  it("always applies httpOnly, path /, and the CSRF-hardened SameSite=Lax", () => {
     const options = getSessionCookieOptions(requestWith({}, "https"));
     expect(options.httpOnly).toBe(true);
     expect(options.path).toBe("/");
-    expect(options.sameSite).toBe("none");
+    // The pre-hardening value was SameSite=None, which would have sent the
+    // session cookie on cross-site POSTs (classic CSRF). It must now be Lax.
+    expect(options.sameSite).toBe("lax");
+    expect(options.sameSite).not.toBe("none");
+  });
+
+  it("never sets a domain attribute (host-only cookie)", () => {
+    const options = getSessionCookieOptions(requestWith({}, "https"));
+    expect(options.domain).toBeUndefined();
   });
 });
