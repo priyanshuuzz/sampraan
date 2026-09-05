@@ -13,7 +13,18 @@ import { useAuth } from "@/_core/hooks/useAuth";
  *
  * No new API surface is invented here — every query maps 1:1 to an existing
  * procedure in server/routers.ts.
+ *
+ * The demo.* fallback procedures are DEVELOPMENT-ONLY on the server (they
+ * throw FORBIDDEN outside development). A production build must not keep
+ * firing them every refetch interval for unauthenticated visitors — that
+ * only produces console errors. Gate the demo queries on the Vite build
+ * mode, which mirrors the server's NODE_ENV check: `vite dev` serves a
+ * development client against a development server; `vite build` output is
+ * served by a production server that correctly refuses demo data.
  */
+
+/** True when this client build runs in development mode (Vite dev server). */
+const isDevBuild = import.meta.env.DEV;
 
 const REFETCH_MS = 30_000;
 const STALE_MS = 15_000;
@@ -54,7 +65,7 @@ export function useIdentities() {
     retry: false,
   });
   const demo = trpc.demo.identities.useQuery(undefined, {
-    enabled: !isAuthenticated,
+    enabled: !isAuthenticated && isDevBuild,
     staleTime: STALE_MS,
     retry: false,
   });
@@ -72,7 +83,7 @@ export function useAssets() {
     retry: false,
   });
   const demo = trpc.demo.assets.useQuery(undefined, {
-    enabled: !isAuthenticated,
+    enabled: !isAuthenticated && isDevBuild,
     staleTime: STALE_MS,
     retry: false,
   });
@@ -90,7 +101,7 @@ export function useAuditEvents() {
     retry: false,
   });
   const demo = trpc.demo.audit.useQuery(undefined, {
-    enabled: !isAuthenticated,
+    enabled: !isAuthenticated && isDevBuild,
     staleTime: STALE_MS,
     retry: false,
   });
@@ -108,7 +119,7 @@ export function useSecurityAlerts() {
     retry: false,
   });
   const demo = trpc.demo.alerts.useQuery(undefined, {
-    enabled: !isAuthenticated,
+    enabled: !isAuthenticated && isDevBuild,
     staleTime: STALE_MS,
     retry: false,
   });
