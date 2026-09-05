@@ -111,7 +111,7 @@ Network files live in `blockchain/network/`:
 - `qbftConfigFile.json` — QBFT genesis definition (chain ID 4224, 2 s blocks)
 - `generated/genesis.json` — genesis produced by
   `besu operator generate-blockchain-config` (includes validator extraData)
-- `generated/keys/<address>/key{,.pub}` — validator node keys (DEMO/LOCAL ONLY)
+- `generated/keys/<address>/key{,.pub}` — validator node keys (DEMO/LOCAL ONLY; **gitignored** — regenerate with `besu operator generate-blockchain-config --config-file=qbftConfigFile.json --to=generated --private-key-file-name=key`)
 - `config/config-validator-*.toml` — per-validator mining/p2p config
 - `config/static-nodes.json` — the four deterministic enode peer addresses
 - `docker-compose.yml` — 4 validators on a fixed `172.28.0.0/16` subnet

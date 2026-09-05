@@ -125,3 +125,10 @@ blockchain/network/*/data/
 # Local blockchain env overrides (contain operator private keys)
 blockchain/.env
 blockchain/*.local.env
+
+# Validator NODE PRIVATE KEYS — never commit; regenerate locally with
+#   docker run --rm -v <repo>/blockchain/network:/q hyperledger/besu:25.10.0 \
+#     operator generate-blockchain-config --config-file=/q/qbftConfigFile.json --to=/q/generated --private-key-file-name=key
+# (keys are dev-only tutorial material for the local QBFT chain, but node
+#  signing keys must never live in version control)
+blockchain/network/generated/keys/
