@@ -12,3 +12,10 @@ patchedDependencies:
 
 overrides:
   tailwindcss>nanoid: 3.3.7
+  # Security overrides (pnpm audit): force patched transitive versions.
+  # lodash/lodash-es >=4.18.0 fix the _.template code-injection advisory
+  # (GHSA-x4vx-rjvf-j5p4) pulled in via recharts (chart rendering) and
+  # streamdown>mermaid (markdown rendering); both are client-side and
+  # never pass untrusted input to _.template, but patch anyway.
+  lodash: 4.18.1
+  lodash-es: 4.18.1

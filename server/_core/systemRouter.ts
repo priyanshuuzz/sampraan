@@ -1,7 +1,14 @@
 import { z } from "zod";
-import { notifyOwner } from "./notification";
-import { adminProcedure, publicProcedure, router } from "./trpc";
+import { publicProcedure, router } from "./trpc";
 
+/**
+ * Minimal system router after dead-template removal (heartbeat/llm/voice/
+ * image/map modules were unreferenced Manus template code).
+ *
+ * The notifyOwner mutation was removed with the notification module: it
+ * existed only to serve the template's heartbeat cron system, which this
+ * application never wires up. No client code referenced it.
+ */
 export const systemRouter = router({
   health: publicProcedure
     .input(
@@ -12,18 +19,4 @@ export const systemRouter = router({
     .query(() => ({
       ok: true,
     })),
-
-  notifyOwner: adminProcedure
-    .input(
-      z.object({
-        title: z.string().min(1, "title is required"),
-        content: z.string().min(1, "content is required"),
-      })
-    )
-    .mutation(async ({ input }) => {
-      const delivered = await notifyOwner(input);
-      return {
-        success: delivered,
-      } as const;
-    }),
 });

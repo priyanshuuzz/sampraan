@@ -751,45 +751,21 @@ describe("demo procedures are development-only", () => {
   });
 });
 
-describe("system.notifyOwner requires an admin", () => {
-  it("rejects a regular user with FORBIDDEN", async () => {
-    const caller = await callerFor(context(userFixture()));
-    await expectTrpcError(
-      caller.system.notifyOwner({ title: "t", content: "c" }),
-      { code: "FORBIDDEN" }
-    );
-  });
-
-  it("rejects an anonymous caller with FORBIDDEN", async () => {
+describe("system.health (public) after dead-template removal", () => {
+  // The template notifyOwner mutation was removed together with the
+  // unreferenced heartbeat/notification modules. The public health
+  // procedure remains and must not require authentication.
+  it("answers an anonymous caller without error", async () => {
     const caller = await callerFor(anonContext());
-    await expectTrpcError(
-      caller.system.notifyOwner({ title: "t", content: "c" }),
-      { code: "FORBIDDEN" }
-    );
+    const result = await caller.system.health({ timestamp: 1 });
+    expect(result).toEqual({ ok: true });
   });
 
-  it("allows an admin through to the notification service", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
-    vi.stubGlobal("fetch", fetchMock);
-    const original = process.env.BUILT_IN_FORGE_API_URL;
-    const originalKey = process.env.BUILT_IN_FORGE_API_KEY;
-    process.env.BUILT_IN_FORGE_API_URL = "https://forge.example.com";
-    process.env.BUILT_IN_FORGE_API_KEY = "test-key";
-    try {
-      const caller = await callerFor(
-        context(userFixture({ role: "admin", openId: "admin-user" }))
-      );
-      const result = await caller.system.notifyOwner({
-        title: "Hello",
-        content: "World",
-      });
-      expect(result).toEqual({ success: true });
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-    } finally {
-      process.env.BUILT_IN_FORGE_API_URL = original;
-      process.env.BUILT_IN_FORGE_API_KEY = originalKey;
-      vi.unstubAllGlobals();
-    }
+  it("validates a negative timestamp as BAD_REQUEST", async () => {
+    const caller = await callerFor(anonContext());
+    await expectTrpcError(caller.system.health({ timestamp: -1 }), {
+      code: "BAD_REQUEST",
+    });
   });
 });
 
