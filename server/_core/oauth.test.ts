@@ -11,6 +11,8 @@ import {
 // contract (status codes, cookies, redirects) can be asserted in isolation.
 const dbMocks = vi.hoisted(() => ({
   upsertUser: vi.fn(),
+  getUserByOpenId: vi.fn(),
+  trackPlatformSession: vi.fn(),
 }));
 
 const sdkMocks = vi.hoisted(() => ({
@@ -249,6 +251,10 @@ describe("GET /api/oauth/callback", () => {
     });
     sdkMocks.createSessionToken.mockResolvedValue("session-token-value");
     dbMocks.upsertUser.mockResolvedValue(undefined);
+    // Session tracking: the login path persists the minted token so an
+    // administrator can revoke it server-side later.
+    dbMocks.getUserByOpenId.mockResolvedValue({ id: 42, openId: "user-open-id" });
+    dbMocks.trackPlatformSession.mockResolvedValue(undefined);
 
     await handler(requestWithStateCookie(), res);
 
@@ -261,6 +267,14 @@ describe("GET /api/oauth/callback", () => {
         openId: "user-open-id",
         name: "Aarav Mehta",
         loginMethod: "google",
+      })
+    );
+    // SECURITY: the minted token must be recorded for server-side revocation.
+    expect(dbMocks.trackPlatformSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionToken: "session-token-value",
+        linkedUserId: 42,
+        expiresAt: expect.any(Date),
       })
     );
     expect(clearedCookies).toEqual([

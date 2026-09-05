@@ -28,6 +28,15 @@ import {
 import { anchoringService, deriveIdentityWallet } from "./modules/blockchain/anchoring.service";
 import { isDuplicateEntryError } from "./modules/db/db-errors";
 import { describeError } from "./common/error-handler";
+import { parse as parseCookieHeader } from "cookie";
+
+/** Extract the session token from a raw Cookie header (null when absent). */
+function extractSessionCookie(cookieHeader: unknown): string | null {
+  if (typeof cookieHeader !== "string" || cookieHeader.length === 0) return null;
+  const parsed = parseCookieHeader(cookieHeader);
+  const value = parsed[COOKIE_NAME];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
 
 const identityStatus = z.enum(["ACTIVE", "REVOKED", "SUSPENDED"]);
 const assetStatus = z.enum(["ACTIVE", "REVOKED", "PENDING"]);
@@ -58,15 +67,19 @@ export const appRouter = router({
     logout: publicProcedure.mutation(({ ctx }) => {
       const cookieOptions = getSessionCookieOptions(ctx.req);
       ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
-      // QA #5: logout must also revoke the tracked platform session
-      // server-side, so a stolen copy of the token cannot be replayed after
-      // the legitimate user logged out.
+      // QA #5: logout must revoke the tracked platform session server-side,
+      // so a stolen copy of the token cannot be replayed after the
+      // legitimate user logged out. BOTH delivery channels are covered:
+      // the Authorization bearer header AND the session cookie — a
+      // logout that only cleared the cookie left bearer replay open.
       const bearer = ctx.req.headers.authorization;
-      const token =
+      const bearerToken =
         typeof bearer === "string" && bearer.startsWith("Bearer ")
           ? bearer.slice(7)
           : null;
-      if (token) {
+      const cookieHeader = ctx.req.headers.cookie;
+      const cookieToken = extractSessionCookie(cookieHeader);
+      for (const token of new Set([bearerToken, cookieToken].filter((t): t is string => Boolean(t)))) {
         revokePlatformSession(token).catch((error: unknown) => {
           console.error("[Auth] Failed to revoke platform session on logout:", error);
         });

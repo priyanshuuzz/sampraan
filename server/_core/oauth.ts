@@ -53,6 +53,20 @@ export function registerOAuthRoutes(app: Express) {
         expiresInMs: SESSION_TTL_MS,
       });
 
+      // SECURITY: record the issued token in the sessions table so
+      // server-side revocation (classifyPlatformSession) can act on it.
+      // An untracked token can never be revoked by an administrator.
+      const loginUser = await db.getUserByOpenId(userInfo.openId);
+      if (loginUser) {
+        await db.trackPlatformSession({
+          sessionToken,
+          linkedUserId: loginUser.id,
+          expiresAt: new Date(Date.now() + SESSION_TTL_MS),
+        });
+      } else {
+        console.error("[OAuth] User row missing after upsert; session will be untracked");
+      }
+
       const cookieOptions = getSessionCookieOptions(req);
       res.cookie(COOKIE_NAME, sessionToken, { ...cookieOptions, maxAge: SESSION_TTL_MS });
 

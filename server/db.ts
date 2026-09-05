@@ -406,3 +406,89 @@ export async function revokePlatformSession(sessionToken: string): Promise<boole
     .where(and(eq(sessions.sessionId, sessionToken), isNull(sessions.revokedAt)));
   return (result as unknown as { affectedRows?: number }).affectedRows !== 0;
 }
+
+/**
+ * Track a newly issued platform session token so server-side revocation
+ * (classifyPlatformSession / revokePlatformSession) has a row to act on.
+ *
+ * SECURITY: without this insert, every session minted by a real OAuth login
+ * is UNTRACKED — classifyPlatformSession returns { state: "UNTRACKED" } and
+ * an administrator revocation can never take effect. Tracking is therefore
+ * part of the login path itself, not an optional extra.
+ *
+ * Best-effort by design: a tracking failure must NOT lock the user out of a
+ * cryptographically valid session (availability), but it is logged loudly
+ * because it weakens the revocation guarantee until the next login.
+ *
+ * The identity linkage uses the SAMPRAAN identity bound to the platform
+ * user when one exists; sessions for platform users without a linked
+ * SAMPRAAN identity are tracked against a sentinel identity reference so
+ * the NOT NULL FK still holds. The sentinel row is created on demand.
+ */
+const UNLINKED_SESSIONS_IDENTITY_ID = "00000000-0000-4000-8000-000000000000";
+const UNLINKED_SESSIONS_DID = "did:sampraan:platform-user-sessions";
+
+async function ensureUnlinkedSessionsIdentity(db: NonNullable<Awaited<ReturnType<typeof getDb>>>): Promise<void> {
+  await db
+    .insert(identities)
+    .values({
+      id: UNLINKED_SESSIONS_IDENTITY_ID,
+      displayName: "Platform User Sessions",
+      organization: "SAMPRAAN",
+      status: "ACTIVE",
+      did: UNLINKED_SESSIONS_DID,
+    })
+    .onDuplicateKeyUpdate({ set: { updatedAt: new Date() } });
+}
+
+export async function trackPlatformSession(input: {
+  sessionToken: string;
+  linkedUserId: number;
+  expiresAt: Date;
+}): Promise<void> {
+  const db = await getDb();
+  if (!db) {
+    // No database: revocation tracking is impossible. Log it — the JWT
+    // itself is still the (only) validity boundary in this mode.
+    console.warn("[Auth] Cannot track platform session: database not available");
+    return;
+  }
+
+  try {
+    const userRows = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.id, input.linkedUserId))
+      .limit(1);
+    if (userRows.length === 0) {
+      console.warn("[Auth] Cannot track platform session: user row disappeared mid-login");
+      return;
+    }
+
+    const identityRows = await db
+      .select({ id: identities.id })
+      .from(identities)
+      .where(eq(identities.linkedUserId, input.linkedUserId))
+      .limit(1);
+
+    let identityId = identityRows[0]?.id;
+    if (!identityId) {
+      await ensureUnlinkedSessionsIdentity(db);
+      identityId = UNLINKED_SESSIONS_IDENTITY_ID;
+    }
+
+    await db
+      .insert(sessions)
+      .values({
+        id: crypto.randomUUID(),
+        identityId,
+        sessionId: input.sessionToken,
+        expiresAt: input.expiresAt,
+      })
+      .onDuplicateKeyUpdate({
+        set: { expiresAt: input.expiresAt, revokedAt: null },
+      });
+  } catch (error) {
+    console.error("[Auth] Failed to track platform session:", error);
+  }
+}

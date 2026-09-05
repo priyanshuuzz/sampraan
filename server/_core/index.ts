@@ -125,10 +125,25 @@ async function startServer() {
   }
 
   const preferredPort = parseInt(process.env.PORT || "3000");
-  const port = await findAvailablePort(preferredPort);
 
-  if (port !== preferredPort) {
-    console.log(`Port ${preferredPort} is busy, using port ${port} instead`);
+  // Production must bind the EXACT configured port: behind an orchestrator,
+  // health checks and reverse proxies target a known port, so silently
+  // hopping to 3001+ turns a deploy into a false "unhealthy" outage.
+  // Development keeps the convenience fallback for parallel dev servers.
+  let port: number;
+  if (process.env.NODE_ENV === "production") {
+    const available = await isPortAvailable(preferredPort);
+    if (!available) {
+      throw new Error(
+        `[Production] Port ${preferredPort} is already in use. Refusing to bind a different port — resolve the conflict (or set PORT) and restart.`
+      );
+    }
+    port = preferredPort;
+  } else {
+    port = await findAvailablePort(preferredPort);
+    if (port !== preferredPort) {
+      console.log(`Port ${preferredPort} is busy, using port ${port} instead`);
+    }
   }
 
   server.listen(port, () => {
@@ -137,13 +152,37 @@ async function startServer() {
     startIndexerLoop();
   });
 
-  const shutdown = () => {
+  // Graceful shutdown: stop accepting new work, drain in-flight requests,
+  // and exit. A second signal (container kill escalation) exits immediately.
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) {
+      console.log(`[${signal}] repeated — exiting immediately`);
+      process.exit(1);
+    }
+    shuttingDown = true;
+    console.log(`[${signal}] shutting down gracefully...`);
     stopIndexerLoop();
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 5000).unref();
+    server.close(() => {
+      console.log("[Shutdown] HTTP server closed; exiting");
+      process.exit(0);
+    });
+    // Hard ceiling: never hang the operator longer than this.
+    setTimeout(() => {
+      console.error("[Shutdown] forced exit after drain timeout");
+      process.exit(0);
+    }, 10_000).unref();
   };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("unhandledRejection", (reason) => {
+    // A rejected promise must never leave the process in an undefined state;
+    // log structured and keep serving (it is not fatal by default).
+    console.error(
+      "[Process] Unhandled rejection:",
+      reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason)
+    );
+  });
 }
 
 startServer().catch(console.error);
