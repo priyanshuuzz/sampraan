@@ -33,6 +33,9 @@ Thumbs.db
 # Logs
 logs
 *.log
+
+# Browser debug logs written by the local dev collector
+.manus-logs/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

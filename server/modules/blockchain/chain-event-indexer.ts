@@ -9,7 +9,7 @@
  * window of blocks, maps recognized events to audit rows, and skips what it
  * has already indexed (idempotent by transaction hash).
  */
-import { createAuditEvent } from "../../db";
+import { createAuditEvent, listIndexedChainTxHashes } from "../../db";
 import { besuBlockchainService } from "./blockchain.service";
 import type { ChainEvent } from "./blockchain.types";
 
@@ -49,26 +49,58 @@ export class ChainEventIndexer {
 
     const latestBlock = status.latestBlock;
     const fromBlock = Math.max(0, latestBlock - windowBlocks);
-    const events = await besuBlockchainService.getEvents({
-      fromBlock,
-      toBlock: latestBlock,
-    });
+
+    // BUG-030: the in-memory dedup set alone loses its state on every
+    // process restart, and each restart then re-projects the whole recent
+    // window (observed live: one tx duplicated 4x). Seed the dedup set from
+    // the audit read model so indexing is durable/idempotent across
+    // restarts.
+    try {
+      const persisted = await listIndexedChainTxHashes();
+      for (const hash of persisted) this.indexedTxHashes.add(hash);
+    } catch {
+      // When the DB is unavailable, fall back to memory-only dedup for this
+      // scan — the audit rows cannot be written anyway in that case.
+    }
+
+    let events;
+    try {
+      events = await besuBlockchainService.getEvents({
+        fromBlock,
+        toBlock: latestBlock,
+      });
+    } catch (error) {
+      // BUG-005/QA #6: a range failure must surface as a clear, actionable
+      // error instead of crashing the indexer loop or producing garbage.
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Chain event scan failed for blocks ${fromBlock}..${latestBlock}: ${reason}`
+      );
+    }
 
     let indexed = 0;
     let skipped = 0;
     for (const event of events) {
-      if (this.indexedTxHashes.has(event.transactionHash)) {
+      // Dedup: BOTH the raw transaction hash (persisted rows store this) and
+      // the composite event key (same tx can legitimately emit several
+      // distinct events) must be checked. A re-scan of the same block window
+      // — including after a process restart — must never duplicate rows.
+      const rawHash = event.transactionHash;
+      const key = `${event.transactionHash}:${event.name}:${String(event.args?.tokenId ?? event.args?.wallet ?? "")}`;
+      if (this.indexedTxHashes.has(rawHash) || this.indexedTxHashes.has(key)) {
         skipped++;
         continue;
       }
       const projected = this.project(event);
       if (!projected) {
         skipped++;
-        this.indexedTxHashes.add(event.transactionHash);
+        this.indexedTxHashes.add(key);
+        this.indexedTxHashes.add(rawHash);
         continue;
       }
       await createAuditEvent(projected);
-      this.indexedTxHashes.add(event.transactionHash);
+      this.indexedTxHashes.add(key);
+      this.indexedTxHashes.add(rawHash);
       indexed++;
     }
 
@@ -100,6 +132,9 @@ export class ChainEventIndexer {
       reason: `On-chain event ${event.name} at block ${event.blockNumber}`,
       transactionHash: event.transactionHash,
       blockNumber: event.blockNumber,
+      // Mark the row as chain-derived so the audit API can distinguish
+      // application decisions from on-chain projections.
+      source: "CHAIN_READ_MODEL" as const,
       metadata: { source: "chain-indexer", contract: event.address, args },
     };
   }

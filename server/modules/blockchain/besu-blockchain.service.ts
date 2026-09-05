@@ -35,9 +35,9 @@ import {
   createAccessControlContract,
   createAssetRegistryContract,
   createIdentityRegistryContract,
-  SampraanAccessControlABI,
-  SampraanAssetRegistryABI,
-  SampraanIdentityRegistryABI,
+  getSampraanAccessControlABI,
+  getSampraanAssetRegistryABI,
+  getSampraanIdentityRegistryABI,
   type SampraanAccessControlHandle,
   type SampraanAssetRegistryHandle,
   type SampraanIdentityRegistryHandle,
@@ -84,6 +84,19 @@ export class BesuBlockchainService {
 
     this.provider = new JsonRpcProvider(rpcUrl, chainId, { staticNetwork: true });
     this.signer = new Wallet(privateKey, this.provider);
+
+    // BUG-014: verify the connected network actually IS the configured chain
+    // before binding contract addresses. Without this, a mis-pointed RPC
+    // (or a replayed deployment.json against a different network) would
+    // silently produce calls to non-existent contracts on the wrong chain,
+    // surfacing as opaque revert errors instead of a clear mismatch message.
+    const network = await this.provider.getNetwork();
+    if (Number(network.chainId) !== chainId) {
+      this.initPromise = null;
+      throw new Error(
+        `Chain ID mismatch: RPC at ${rpcUrl} reports chain ${Number(network.chainId)}, expected ${chainId}. Refusing to bind SAMPRAAN contracts to the wrong network. Check BLOCKCHAIN_CHAIN_ID / BLOCKCHAIN_RPC_URL.`
+      );
+    }
 
     this.accessControlContract = createAccessControlContract(
       this.requireAddress(this.config.accessControlContractAddress, "access control"),
@@ -464,9 +477,9 @@ export class BesuBlockchainService {
 
   private parseLog(log: Log): ChainEvent | null {
     const candidates: Array<[InterfaceAbi, string | null]> = [
-      [SampraanIdentityRegistryABI, this.config.identityContractAddress],
-      [SampraanAssetRegistryABI, this.config.assetContractAddress],
-      [SampraanAccessControlABI, this.config.accessControlContractAddress],
+      [getSampraanIdentityRegistryABI(), this.config.identityContractAddress],
+      [getSampraanAssetRegistryABI(), this.config.assetContractAddress],
+      [getSampraanAccessControlABI(), this.config.accessControlContractAddress],
     ];
     for (const [abi, address] of candidates) {
       if (!address) continue;

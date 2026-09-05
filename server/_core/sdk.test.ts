@@ -6,6 +6,14 @@ import type { Request } from "express";
 const dbMocks = vi.hoisted(() => ({
   upsertUser: vi.fn(),
   getUserByOpenId: vi.fn(),
+  // BUG-007 gate: authenticateRequest resolves the linked SAMPRAAN identity
+  // status on every request. Default to "no linked identity" (platform user
+  // without a SAMPRAAN binding); tests that care override it.
+  getIdentityByLinkedUserId: vi.fn(),
+  // QA #5 gate: server-side session revocation classification. Default to
+  // UNTRACKED so legacy token flows are unaffected; revocation tests
+  // override it.
+  classifyPlatformSession: vi.fn(),
 }));
 
 vi.mock("../db", () => dbMocks);
@@ -35,6 +43,12 @@ beforeEach(() => {
   process.env[ENV_KEYS.appId] = "sampraan-test-app";
   process.env[ENV_KEYS.oAuthServerUrl] = "https://oauth.example.com";
   vi.clearAllMocks();
+  // BUG-007 default: no linked SAMPRAAN identity for the test user — the
+  // session gate must pass when no identity binding exists.
+  dbMocks.getIdentityByLinkedUserId.mockResolvedValue(undefined);
+  // QA #5 default: token not tracked server-side — JWT verification alone
+  // governs (legacy/cron token flows).
+  dbMocks.classifyPlatformSession.mockResolvedValue({ state: "UNTRACKED" });
 });
 
 afterEach(() => {
@@ -153,6 +167,116 @@ describe("SDKServer session tokens", () => {
 });
 
 describe("SDKServer.authenticateRequest", () => {
+  it("BUG-007: rejects a session whose linked SAMPRAAN identity is REVOKED", async () => {
+    const { sdk } = await loadSdk();
+    const { COOKIE_NAME } = await import("../../shared/const");
+    const token = await sdk.createSessionToken("user-open-id", {
+      name: "Aarav Mehta",
+    });
+    dbMocks.getUserByOpenId.mockResolvedValue(signedInUser());
+    dbMocks.upsertUser.mockResolvedValue(undefined);
+    dbMocks.getIdentityByLinkedUserId.mockResolvedValue({
+      id: "identity-1",
+      linkedUserId: 1,
+      status: "REVOKED",
+    });
+
+    await expect(
+      sdk.authenticateRequest(expressRequest({ cookie: `${COOKIE_NAME}=${token}` }))
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it("BUG-007: rejects a session whose linked SAMPRAAN identity is SUSPENDED", async () => {
+    const { sdk } = await loadSdk();
+    const { COOKIE_NAME } = await import("../../shared/const");
+    const token = await sdk.createSessionToken("user-open-id", {
+      name: "Aarav Mehta",
+    });
+    dbMocks.getUserByOpenId.mockResolvedValue(signedInUser());
+    dbMocks.upsertUser.mockResolvedValue(undefined);
+    dbMocks.getIdentityByLinkedUserId.mockResolvedValue({
+      id: "identity-1",
+      linkedUserId: 1,
+      status: "SUSPENDED",
+    });
+
+    await expect(
+      sdk.authenticateRequest(expressRequest({ cookie: `${COOKIE_NAME}=${token}` }))
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it("BUG-007: allows a session whose linked SAMPRAAN identity is ACTIVE", async () => {
+    const { sdk } = await loadSdk();
+    const { COOKIE_NAME } = await import("../../shared/const");
+    const token = await sdk.createSessionToken("user-open-id", {
+      name: "Aarav Mehta",
+    });
+    dbMocks.getUserByOpenId.mockResolvedValue(signedInUser());
+    dbMocks.upsertUser.mockResolvedValue(undefined);
+    dbMocks.getIdentityByLinkedUserId.mockResolvedValue({
+      id: "identity-1",
+      linkedUserId: 1,
+      status: "ACTIVE",
+    });
+
+    const user = await sdk.authenticateRequest(
+      expressRequest({ cookie: `${COOKIE_NAME}=${token}` })
+    );
+    expect(user).toMatchObject({ openId: "user-open-id", role: "user" });
+  });
+
+  it("QA #5: rejects a session revoked server-side even though the JWT is still valid", async () => {
+    const { sdk } = await loadSdk();
+    const { COOKIE_NAME } = await import("../../shared/const");
+    const token = await sdk.createSessionToken("user-open-id", {
+      name: "Aarav Mehta",
+    });
+    dbMocks.getUserByOpenId.mockResolvedValue(signedInUser());
+    dbMocks.upsertUser.mockResolvedValue(undefined);
+    dbMocks.classifyPlatformSession.mockResolvedValue({ state: "REVOKED" });
+
+    await expect(
+      sdk.authenticateRequest(expressRequest({ cookie: `${COOKIE_NAME}=${token}` }))
+    ).rejects.toMatchObject({ statusCode: 403 });
+    expect(dbMocks.classifyPlatformSession).toHaveBeenCalledWith(token);
+  });
+
+  it("QA #5: rejects a session expired server-side even though the JWT is still valid", async () => {
+    const { sdk } = await loadSdk();
+    const { COOKIE_NAME } = await import("../../shared/const");
+    const token = await sdk.createSessionToken("user-open-id", {
+      name: "Aarav Mehta",
+    });
+    dbMocks.getUserByOpenId.mockResolvedValue(signedInUser());
+    dbMocks.upsertUser.mockResolvedValue(undefined);
+    dbMocks.classifyPlatformSession.mockResolvedValue({ state: "EXPIRED" });
+
+    await expect(
+      sdk.authenticateRequest(expressRequest({ cookie: `${COOKIE_NAME}=${token}` }))
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it("QA #5: passes an ACTIVE tracked session", async () => {
+    const { sdk } = await loadSdk();
+    const { COOKIE_NAME } = await import("../../shared/const");
+    const token = await sdk.createSessionToken("user-open-id", {
+      name: "Aarav Mehta",
+    });
+    dbMocks.getUserByOpenId.mockResolvedValue(signedInUser());
+    dbMocks.upsertUser.mockResolvedValue(undefined);
+    dbMocks.classifyPlatformSession.mockResolvedValue({
+      state: "ACTIVE",
+      id: "session-row",
+      identityId: "identity-1",
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+
+    const user = await sdk.authenticateRequest(
+      expressRequest({ cookie: `${COOKIE_NAME}=${token}` })
+    );
+    expect(user).toMatchObject({ openId: "user-open-id" });
+  });
+
   it("authenticates a request with a valid session cookie", async () => {
     const { sdk } = await loadSdk();
     const { COOKIE_NAME } = await import("../../shared/const");

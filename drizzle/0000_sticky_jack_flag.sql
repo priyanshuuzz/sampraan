@@ -64,6 +64,20 @@ CREATE TABLE `authorization_decisions` (
 	CONSTRAINT `authorization_decisions_id` PRIMARY KEY(`id`)
 );
 --> statement-breakpoint
+CREATE TABLE `did_records` (
+	`id` varchar(36) NOT NULL,
+	`identityId` varchar(36) NOT NULL,
+	`did` varchar(255) NOT NULL,
+	`method` varchar(80) NOT NULL,
+	`subject` varchar(255) NOT NULL,
+	`document` json,
+	`status` enum('ACTIVE','REVOKED') NOT NULL DEFAULT 'ACTIVE',
+	`createdAt` timestamp NOT NULL DEFAULT (now()),
+	`revokedAt` timestamp,
+	CONSTRAINT `did_records_id` PRIMARY KEY(`id`),
+	CONSTRAINT `did_records_did_unique` UNIQUE(`did`)
+);
+--> statement-breakpoint
 CREATE TABLE `identities` (
 	`id` varchar(36) NOT NULL,
 	`linkedUserId` int,
@@ -188,6 +202,7 @@ ALTER TABLE `assets` ADD CONSTRAINT `assets_custodianIdentityId_identities_id_fk
 ALTER TABLE `audit_events` ADD CONSTRAINT `audit_events_actorIdentityId_identities_id_fk` FOREIGN KEY (`actorIdentityId`) REFERENCES `identities`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE `authorization_decisions` ADD CONSTRAINT `authorization_decisions_actorIdentityId_identities_id_fk` FOREIGN KEY (`actorIdentityId`) REFERENCES `identities`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE `authorization_decisions` ADD CONSTRAINT `authorization_decisions_policyId_policies_id_fk` FOREIGN KEY (`policyId`) REFERENCES `policies`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `did_records` ADD CONSTRAINT `did_records_identityId_identities_id_fk` FOREIGN KEY (`identityId`) REFERENCES `identities`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE `identities` ADD CONSTRAINT `identities_linkedUserId_users_id_fk` FOREIGN KEY (`linkedUserId`) REFERENCES `users`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE `identity_roles` ADD CONSTRAINT `identity_roles_identityId_identities_id_fk` FOREIGN KEY (`identityId`) REFERENCES `identities`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE `identity_roles` ADD CONSTRAINT `identity_roles_roleId_roles_id_fk` FOREIGN KEY (`roleId`) REFERENCES `roles`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
@@ -203,6 +218,7 @@ CREATE INDEX `assets_custodian_idx` ON `assets` (`custodianIdentityId`);--> stat
 CREATE INDEX `audit_events_time_idx` ON `audit_events` (`timestamp`);--> statement-breakpoint
 CREATE INDEX `audit_events_resource_idx` ON `audit_events` (`resourceType`,`resourceId`);--> statement-breakpoint
 CREATE INDEX `authorization_actor_time_idx` ON `authorization_decisions` (`actorIdentityId`,`timestamp`);--> statement-breakpoint
+CREATE INDEX `did_records_identity_idx` ON `did_records` (`identityId`);--> statement-breakpoint
 CREATE INDEX `identities_organization_idx` ON `identities` (`organization`);--> statement-breakpoint
 CREATE INDEX `policies_match_idx` ON `policies` (`resourceType`,`action`,`active`);--> statement-breakpoint
 CREATE INDEX `public_keys_identity_idx` ON `public_keys` (`identityId`);

@@ -5,8 +5,11 @@ import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
 import { authorizationService } from "./modules/authorization/authorization.service";
-import { blockchainService } from "./modules/blockchain/blockchain.service";
+import { blockchainService, besuBlockchainService } from "./modules/blockchain/blockchain.service";
 import {
+  applyAssetStatusChange,
+  applyCustodyTransfer,
+  applyIdentityStatusChange,
   createAsset,
   createAuditEvent,
   createAuthorizationDecision,
@@ -20,7 +23,10 @@ import {
   listAuditEvents,
   listIdentities,
   listSecurityAlerts,
+  revokePlatformSession,
 } from "./db";
+import { anchoringService, deriveIdentityWallet } from "./modules/blockchain/anchoring.service";
+import { isDuplicateEntryError } from "./modules/db/db-errors";
 
 const identityStatus = z.enum(["ACTIVE", "REVOKED", "SUSPENDED"]);
 const assetStatus = z.enum(["ACTIVE", "REVOKED", "PENDING"]);
@@ -51,6 +57,19 @@ export const appRouter = router({
     logout: publicProcedure.mutation(({ ctx }) => {
       const cookieOptions = getSessionCookieOptions(ctx.req);
       ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+      // QA #5: logout must also revoke the tracked platform session
+      // server-side, so a stolen copy of the token cannot be replayed after
+      // the legitimate user logged out.
+      const bearer = ctx.req.headers.authorization;
+      const token =
+        typeof bearer === "string" && bearer.startsWith("Bearer ")
+          ? bearer.slice(7)
+          : null;
+      if (token) {
+        revokePlatformSession(token).catch((error: unknown) => {
+          console.error("[Auth] Failed to revoke platform session on logout:", error);
+        });
+      }
       return { success: true } as const;
     }),
   }),
@@ -61,10 +80,11 @@ export const appRouter = router({
     // create identity records that the authorization engine then trusts.
     create: adminProcedure.input(z.object({ displayName: z.string().min(2).max(160), organization: z.string().min(2).max(180), did, status: identityStatus.default("ACTIVE") })).mutation(async ({ input }) => {
       const identity = await createIdentity(input).catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
         // identities.did is UNIQUE; a duplicate DID must surface as a clear
-        // client error instead of a masked 500.
-        if (/duplicate entry|ER_DUP_ENTRY/i.test(message)) {
+        // client error instead of a masked 500. NOTE (QA #1 regression): the
+        // mysql2 error lives in error.cause after drizzle wraps it, so the
+        // old message-only regex never matched — duplicates returned 500.
+        if (isDuplicateEntryError(error)) {
           throw new TRPCError({ code: "CONFLICT", message: "An identity with this DID already exists" });
         }
         throw error;
@@ -80,7 +100,82 @@ export const appRouter = router({
         document: { id: input.did, verificationMethod: [] },
         status: input.status === "ACTIVE" ? "ACTIVE" : "REVOKED",
       }).catch(() => { /* DID record is derived material; the identity itself was created. */ });
-      return identity;
+      // BUG-003 (QA #3): anchor the identity reference on the Besu chain so
+      // its lifecycle is tamper-evident from birth. Best-effort: the chain
+      // being down must not make identity creation impossible, but every
+      // attempt (anchored / skipped / failed) is audited.
+      const anchor = await anchoringService.anchorIdentity({
+        did: input.did,
+        displayName: input.displayName,
+      });
+      return { ...identity, anchor };
+    }),
+    /**
+     * Identity lifecycle management (admin only). Updating the status
+     * updates the read model, revokes the derived DID record, anchors the
+     * status change on the Besu chain when configured, and — through the
+     * session gate in sdk.authenticateRequest — immediately strips platform
+     * privileges from any session bound to a REVOKED/SUSPENDED identity
+     * (BUG-007 / QA #4).
+     */
+    setStatus: adminProcedure.input(z.object({ identityId: z.string().uuid(), status: identityStatus })).mutation(async ({ input }) => {
+      const identity = await getIdentityById(input.identityId);
+      if (!identity) throw new TRPCError({ code: "NOT_FOUND", message: "Identity not found" });
+      if (identity.status === input.status) {
+        return { ...identity, changed: false as const };
+      }
+      const updated = await applyIdentityStatusChange({
+        identityId: input.identityId,
+        status: input.status,
+      });
+
+      // Anchor the status change on-chain when a real chain is configured.
+      // The status call targets the identity's deterministic on-chain reference
+      // wallet — never the shared operator wallet, which would move every
+      // identity's status at once.
+      let anchor: { outcome: string; reason?: string } | null = null;
+      if (besuBlockchainService) {
+        try {
+          const operatorKey = besuBlockchainService.config.privateKey;
+          const walletAddress = operatorKey
+            ? deriveIdentityWallet(operatorKey, identity.did)
+            : null;
+          if (!walletAddress) {
+            anchor = { outcome: "SKIPPED", reason: "Operator key not configured; status change not anchored on-chain" };
+          } else {
+            // The wallet must exist on-chain before its status can change.
+            // Seed-created identities may never have been anchored; anchor
+            // idempotently first (AlreadyRegistered is handled as a skip).
+            await anchoringService.anchorIdentity({
+              did: identity.did,
+              displayName: identity.displayName,
+            });
+            const evidence = await besuBlockchainService.setIdentityStatus({
+              walletAddress,
+              status: input.status,
+            });
+            anchor = { outcome: "ANCHORED", reason: evidence.transactionHash };
+          }
+        } catch (error) {
+          anchor = {
+            outcome: "FAILED",
+            reason: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }
+
+      await createAuditEvent({
+        actorIdentityId: identity.id,
+        action: input.status === "REVOKED" ? "IDENTITY_REVOKED" : input.status === "SUSPENDED" ? "IDENTITY_SUSPENDED" : "IDENTITY_REACTIVATED",
+        resourceType: "IDENTITY",
+        resourceId: identity.id,
+        decision: "ALLOW",
+        reason: `Identity status set to ${input.status} by an administrator`,
+        transactionHash: anchor?.outcome === "ANCHORED" ? anchor.reason ?? null : null,
+        metadata: { source: "identity-administration", previousStatus: identity.status, newStatus: input.status, anchorOutcome: anchor?.outcome ?? "SKIPPED" },
+      }).catch(() => { /* evidence best-effort */ });
+
+      return { ...(updated ?? identity), changed: true as const, anchor };
     }),
   }),
   assets: router({
@@ -89,14 +184,76 @@ export const appRouter = router({
     // classification, which drives POLICY-HIGH-SENS-TRANSFER) is
     // administrative. Users must not mint low-classification records to
     // smuggle assets past the transfer policy.
-    create: adminProcedure.input(z.object({ assetId: z.string().min(2).max(120), name: z.string().min(2).max(200), type: z.string().min(2).max(80), classification: assetClassification, description: z.string().max(5000).optional(), ownerIdentityId: z.string().uuid(), custodianIdentityId: z.string().uuid(), integrityHash: z.string().max(255).optional(), tokenId: z.string().max(160).optional(), status: assetStatus.default("PENDING") })).mutation(({ input }) => createAsset(input).catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      // assets.assetId is UNIQUE; surface duplicates as a clear client error.
-      if (/duplicate entry|ER_DUP_ENTRY/i.test(message)) {
-        throw new TRPCError({ code: "CONFLICT", message: "An asset with this assetId already exists" });
+    create: adminProcedure.input(z.object({ assetId: z.string().min(2).max(120), name: z.string().min(2).max(200), type: z.string().min(2).max(80), classification: assetClassification, description: z.string().max(5000).optional(), ownerIdentityId: z.string().uuid(), custodianIdentityId: z.string().uuid(), integrityHash: z.string().max(255).optional(), tokenId: z.string().max(160).optional(), status: assetStatus.default("PENDING") })).mutation(async ({ input }) => {
+      const asset = await createAsset(input).catch((error: unknown) => {
+        // assets.assetId is UNIQUE; surface duplicates as a clear client
+        // error. Same cause-chain handling as identities.create (QA #1).
+        if (isDuplicateEntryError(error)) {
+          throw new TRPCError({ code: "CONFLICT", message: "An asset with this assetId already exists" });
+        }
+        throw error;
+      });
+      // BUG-003 (QA #3): anchor the asset on the Besu chain (controlled mint)
+      // so ownership/custody provenance starts on-chain. Best-effort with a
+      // full audit trail of the anchor outcome.
+      const anchor = await anchoringService.anchorAsset({
+        assetId: input.assetId,
+        classification: input.classification,
+        integrityHash: input.integrityHash ?? null,
+      });
+      return { ...asset, anchor };
+    }),
+    /**
+     * Asset lifecycle management (admin only). BUG-028: assets were created
+     * PENDING with NO way to ever activate them, making every API-created
+     * asset permanently untransferable. This transitions the read-model
+     * status and mirrors the lifecycle on-chain (ACTIVATE/SUSPEND/RESTORE/
+     * REVOKE) when a real chain is configured, with full audit evidence.
+     */
+    setStatus: adminProcedure.input(z.object({ assetId: z.string().uuid(), status: assetStatus })).mutation(async ({ input }) => {
+      const asset = await getAssetById(input.assetId);
+      if (!asset) throw new TRPCError({ code: "NOT_FOUND", message: "Asset not found" });
+      if (asset.status === input.status) {
+        return { ...asset, changed: false as const };
       }
-      throw error;
-    })),
+      const updated = await applyAssetStatusChange({
+        assetRowId: asset.id,
+        status: input.status,
+      });
+
+      // Mirror the lifecycle change on-chain when configured.
+      let anchor: { outcome: string; reason?: string } | null = null;
+      if (besuBlockchainService) {
+        const chainStatus =
+          input.status === "ACTIVE" ? "ACTIVATE" :
+          input.status === "REVOKED" ? "REVOKE" : "SUSPEND";
+        try {
+          const evidence = await besuBlockchainService.setAssetStatus({
+            assetId: asset.assetId,
+            status: chainStatus as "ACTIVATE" | "SUSPEND" | "RESTORE" | "REVOKE",
+          });
+          anchor = { outcome: "ANCHORED", reason: evidence.transactionHash };
+        } catch (error) {
+          anchor = {
+            outcome: "FAILED",
+            reason: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }
+
+      await createAuditEvent({
+        actorIdentityId: null,
+        action: input.status === "ACTIVE" ? "ASSET_ACTIVATED" : input.status === "REVOKED" ? "ASSET_REVOKED" : "ASSET_SUSPENDED",
+        resourceType: "ASSET",
+        resourceId: asset.assetId,
+        decision: "ALLOW",
+        reason: `Asset status set to ${input.status} by an administrator`,
+        transactionHash: anchor?.outcome === "ANCHORED" ? anchor.reason ?? null : null,
+        metadata: { source: "asset-administration", previousStatus: asset.status, newStatus: input.status, anchorOutcome: anchor?.outcome ?? "SKIPPED" },
+      }).catch(() => { /* evidence best-effort */ });
+
+      return { ...(updated ?? asset), changed: true as const, anchor };
+    }),
     // SECURITY: classification and step-up state come exclusively from
     // server-side state. The client may only name the asset; it can never
     // assert its own classification, role, permissions, or step-up state.
@@ -211,11 +368,29 @@ export const appRouter = router({
 
       // Policy ALLOWed the request. The smart contract now INDEPENDENTLY
       // re-verifies role, identity status, and asset state on-chain; only a
-      // successful receipt produces a confirmed transaction record. On the
-      // real Besu chain the transfer is submitted to the configured custodian
-      // wallet; in MOCK mode (chain-less environments/tests) the legacy mock
-      // evidence path is used so the flow stays exercisable without a chain.
-      const toCustodianWallet = blockchainService.operatorAddress;
+      // successful receipt produces a confirmed transaction record.
+      //
+      // BUG-029: the transfer target must be the ACTING identity's on-chain
+      // reference wallet — not the shared operator wallet. Assets anchored at
+      // creation already sit with the operator wallet, so transferring
+      // "to the operator" reverts with SameAssetStatus() (0x27479240) and the
+      // custody never moves. Each identity's wallet is derived
+      // deterministically from its DID, so custody flows to the authorized
+      // actor exactly as the policy engine decided.
+      const operatorKey = besuBlockchainService?.config.privateKey ?? null;
+      const toCustodianWallet = actorIdentity && operatorKey
+        ? deriveIdentityWallet(operatorKey, actorIdentity.did)
+        : blockchainService.operatorAddress;
+      // The contract requires the RECIPIENT identity to be ACTIVE on-chain
+      // (RecipientNotActive). An actor identity that exists in the read model
+      // but was never anchored would fail the transfer; anchor it now —
+      // idempotent, best-effort, and audited exactly like creation.
+      if (actorIdentity && operatorKey && blockchainService.mode === "BESU") {
+        await anchoringService.anchorIdentity({
+          did: actorIdentity.did,
+          displayName: actorIdentity.displayName,
+        });
+      }
       if (blockchainService.mode === "BESU" && !toCustodianWallet) {
         // A real-chain custody transfer needs a custodian wallet on the
         // contract call; without it the transfer cannot happen. Record the
@@ -272,6 +447,35 @@ export const appRouter = router({
         console.error("[Authorization] Failed to persist transfer audit event:", persistError);
       });
 
+      // BUG-006: the chain is authoritative, but the read model must agree
+      // with it. After a CONFIRMED transfer, move the DB custodian + custody
+      // history to the acting (authorized) identity. If the DB write fails,
+      // record the drift explicitly — never silently leave the two layers
+      // disagreeing.
+      const custodianUpdate = await applyCustodyTransfer({
+        assetRowId: asset.id,
+        newCustodianIdentityId: actorIdentity?.id ?? null,
+        reason: `On-chain custody transfer confirmed in tx ${transaction.transactionHash}`,
+        transactionHash: transaction.transactionHash,
+        blockNumber: transaction.blockNumber,
+      }).catch((dbError: unknown) => {
+        console.error("[Authorization] Custody read-model update failed after on-chain transfer:", dbError);
+        return null;
+      });
+      if (!custodianUpdate) {
+        await createAuditEvent({
+          actorIdentityId: actorIdentity?.id ?? null,
+          action: "CUSTODY_SYNC_FAILED",
+          resourceType: "ASSET",
+          resourceId: asset.assetId,
+          decision: "CHALLENGE",
+          reason: "On-chain transfer confirmed but the database custodian could not be updated",
+          transactionHash: transaction.transactionHash,
+          blockNumber: transaction.blockNumber,
+          metadata: { source: "blockchain-evidence", ...actingUser },
+        }).catch(() => { /* best-effort evidence */ });
+      }
+
       return { ...result, transaction };
 
     }),
@@ -282,7 +486,23 @@ export const appRouter = router({
     status: publicProcedure.query(() => blockchainService.getNetworkStatus()),
     latestBlock: publicProcedure.query(() => blockchainService.getLatestBlock()),
     transaction: protectedProcedure.input(z.object({ transactionHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/) })).query(({ input }) => blockchainService.getTransaction(input.transactionHash)),
-    events: protectedProcedure.input(z.object({ fromBlock: z.number().int().min(0).optional(), toBlock: z.number().int().min(0).optional() }).optional()).query(({ input }) => blockchainService.getEvents(input)),
+    events: protectedProcedure.input(z.object({ fromBlock: z.number().int().min(0).optional(), toBlock: z.number().int().min(0).optional() }).optional().refine(input => !input || input.fromBlock === undefined || input.toBlock === undefined || input.toBlock >= input.fromBlock, { message: "toBlock must be greater than or equal to fromBlock" })).query(async ({ input }) => {
+      // BUG-005 (QA #6): large/invalid ranges previously produced raw driver
+      // errors. Validate and clamp the window, and surface a clear error when
+      // the chain cannot serve the request.
+      if (input && input.fromBlock !== undefined && input.toBlock !== undefined) {
+        const span = input.toBlock - input.fromBlock;
+        if (span > 10_000) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: `Block range too large (${span} blocks). Query at most 10,000 blocks per request.` });
+        }
+      }
+      try {
+        return await blockchainService.getEvents(input);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new TRPCError({ code: "BAD_GATEWAY", message: `Blockchain event query failed: ${reason}` });
+      }
+    }),
   }),
 });
 

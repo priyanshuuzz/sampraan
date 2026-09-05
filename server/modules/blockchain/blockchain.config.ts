@@ -8,6 +8,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
+import { resolveProjectRoot } from "./paths";
 
 export interface BlockchainConfig {
   mode: "BESU" | "MOCK";
@@ -30,13 +31,14 @@ export interface DeploymentRecord {
   };
 }
 
-const root = path.resolve(import.meta.dirname, "..", "..", "..");
-const deploymentFile = path.join(root, "blockchain", "deployment.json");
+const deploymentFile = (): string =>
+  path.join(resolveProjectRoot(), "blockchain", "deployment.json");
 
 function readDeployment(): DeploymentRecord | null {
   try {
-    if (!existsSync(deploymentFile)) return null;
-    return JSON.parse(readFileSync(deploymentFile, "utf8")) as DeploymentRecord;
+    const file = deploymentFile();
+    if (!existsSync(file)) return null;
+    return JSON.parse(readFileSync(file, "utf8")) as DeploymentRecord;
   } catch {
     return null;
   }

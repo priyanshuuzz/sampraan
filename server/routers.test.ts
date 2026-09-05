@@ -19,6 +19,8 @@ const dbMocks = vi.hoisted(() => ({
   listAuditEvents: vi.fn(),
   listSecurityAlerts: vi.fn(),
   createDidRecord: vi.fn(),
+  applyCustodyTransfer: vi.fn(),
+  applyIdentityStatusChange: vi.fn(),
 }));
 
 const blockchainMocks = vi.hoisted(() => ({
@@ -29,6 +31,12 @@ const blockchainMocks = vi.hoisted(() => ({
   getEvents: vi.fn(),
   operatorAddress: null as string | null,
   mode: "MOCK" as const,
+  besu: null as null | {
+    operatorAddress: string;
+    registerIdentity: ReturnType<typeof vi.fn>;
+    registerAsset: ReturnType<typeof vi.fn>;
+    setIdentityStatus: ReturnType<typeof vi.fn>;
+  },
 }));
 
 vi.mock("./db", () => dbMocks);
@@ -41,6 +49,13 @@ vi.mock("./modules/blockchain/blockchain.service", () => ({
     getEvents: blockchainMocks.getEvents,
     operatorAddress: blockchainMocks.operatorAddress,
     mode: blockchainMocks.mode,
+  },
+  besuBlockchainService: blockchainMocks.besu,
+}));
+vi.mock("./modules/blockchain/anchoring.service", () => ({
+  anchoringService: {
+    anchorIdentity: vi.fn(async () => ({ outcome: "SKIPPED", reason: "mock" })),
+    anchorAsset: vi.fn(async () => ({ outcome: "SKIPPED", reason: "mock" })),
   },
 }));
 
@@ -69,6 +84,10 @@ beforeEach(() => {
   dbMocks.createAuditEvent.mockResolvedValue(undefined);
   dbMocks.createDidRecord.mockResolvedValue(undefined);
   dbMocks.createIdentity.mockResolvedValue(undefined);
+  // BUG-006: the custody read-model sync after a confirmed on-chain transfer.
+  // Default to a successful no-change update; individual tests override it.
+  dbMocks.applyCustodyTransfer.mockResolvedValue({ id: "asset-1", updated: true });
+  dbMocks.applyIdentityStatusChange.mockResolvedValue({ id: "identity-1", status: "ACTIVE" });
   // Merged authorizeTransfer resolves the actor identity and the asset owner
   // from the database. Default: no linked SAMPRAAN identity (strict DENY) and
   // an ACTIVE owner so the owner guard never masks the case under test.
@@ -217,7 +236,11 @@ describe("identities.create", () => {
 
     const result = await caller.identities.create(validInput);
 
-    expect(result).toEqual(identity);
+    // The creation response now carries the on-chain anchor outcome
+    // (BUG-003): the record itself must round-trip unchanged.
+    expect(result).toMatchObject(identity);
+    expect(result.anchor).toBeDefined();
+    expect(["ANCHORED", "SKIPPED", "FAILED"]).toContain(result.anchor.outcome);
     expect(dbMocks.createIdentity).toHaveBeenCalledWith({
       ...validInput,
       status: "ACTIVE",
@@ -569,7 +592,12 @@ describe("assets.create", () => {
       context(userFixture({ role: "admin", openId: "admin-user" }))
     );
 
-    await expect(caller.assets.create(validInput)).resolves.toEqual(created);
+    const createResult = await caller.assets.create(validInput);
+    // BUG-003: the asset creation response carries the on-chain anchor
+    // outcome; the asset record itself must round-trip unchanged.
+    expect(createResult).toMatchObject(created);
+    expect(createResult.anchor).toBeDefined();
+    expect(["ANCHORED", "SKIPPED", "FAILED"]).toContain(createResult.anchor.outcome);
     expect(dbMocks.createAsset).toHaveBeenCalledWith({
       ...validInput,
       status: "PENDING",

@@ -1,8 +1,12 @@
 import { randomUUID } from "node:crypto";
 import mysql from "mysql2/promise";
+// BUG-026: the seed script never loaded .env, so "pnpm seed:demo" failed
+// with "DATABASE_URL is required" even when a perfectly good .env sat next
+// to package.json. dotenv is already a dependency; load it before reading env.
+import "dotenv/config";
 
 const url = process.env.DATABASE_URL;
-if (!url) throw new Error("DATABASE_URL is required to run the demo seed");
+if (!url) throw new Error("DATABASE_URL is required to run the demo seed (set it in .env or the environment)");
 const connection = await mysql.createConnection(url);
 const id = () => randomUUID();
 

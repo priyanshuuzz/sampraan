@@ -45,8 +45,29 @@ function loadArtifact(name: string) {
 async function main() {
   const rpcUrl = process.env.BLOCKCHAIN_RPC_URL ?? "http://localhost:8545";
   const chainIdEnv = Number(process.env.BLOCKCHAIN_CHAIN_ID ?? EXPECTED_CHAIN_ID);
+  const isProduction = process.env.NODE_ENV === "production";
   const privateKey =
     process.env.BLOCKCHAIN_PRIVATE_KEY ?? DEMO_LOCAL_DEPLOYER_KEY;
+
+  // BUG-013 (QA finding #10): the demo genesis fallback key is a PUBLICLY
+  // DOCUMENTED development key from the Besu QBFT tutorial. Deploying with
+  // it in production would hand the entire contract suite (admin roles, the
+  // identity and asset registries) to anyone who has read the tutorial. Any
+  // real environment must provide its own key explicitly.
+  if (
+    isProduction &&
+    (!process.env.BLOCKCHAIN_PRIVATE_KEY ||
+      privateKey === DEMO_LOCAL_DEPLOYER_KEY)
+  ) {
+    throw new Error(
+      "Refusing to deploy with the DEMO/LOCAL genesis key under NODE_ENV=production. Set BLOCKCHAIN_PRIVATE_KEY to a real operator key."
+    );
+  }
+  if (!process.env.BLOCKCHAIN_PRIVATE_KEY) {
+    console.warn(
+      "[DEPLOY] WARNING: using the DEMO/LOCAL genesis deployer key (development only). Set BLOCKCHAIN_PRIVATE_KEY for any real deployment."
+    );
+  }
 
   const provider = new JsonRpcProvider(rpcUrl, chainIdEnv, {
     staticNetwork: true,

@@ -150,7 +150,18 @@ function vitePluginManusDebugCollector(): Plugin {
   };
 }
 
-const plugins = [react(), tailwindcss(), jsxLocPlugin(), vitePluginManusRuntime(), vitePluginManusDebugCollector()];
+// QA #9: the Manus preview runtime and JSX locator are DEVELOPMENT-ONLY
+// harnesses for the sandbox preview environment. Shipping the runtime bloats
+// the production index.html by ~360KB with preview-communication code a
+// real deployment never uses. `vite build` always runs with mode=production,
+// `vite dev` with mode=development, so filter on mode (not NODE_ENV).
+const isDev = process.argv[2] !== "build";
+const plugins = [
+  react(),
+  tailwindcss(),
+  ...(isDev ? [jsxLocPlugin(), vitePluginManusRuntime()] : []),
+  vitePluginManusDebugCollector(),
+];
 
 export default defineConfig({
   plugins,

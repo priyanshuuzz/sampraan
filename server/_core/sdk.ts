@@ -1,5 +1,5 @@
 import { AXIOS_TIMEOUT_MS, COOKIE_NAME, SESSION_TTL_MS, decodeOAuthState } from "@shared/const";
-import { ForbiddenError } from "@shared/_core/errors";
+import { ForbiddenError, HttpError } from "@shared/_core/errors";
 import axios, { type AxiosInstance } from "axios";
 import { parse as parseCookieHeader } from "cookie";
 import type { Request } from "express";
@@ -285,6 +285,31 @@ class SDKServer {
       throw ForbiddenError("Invalid session cookie");
     }
 
+    // QA #5 (server-side session revocation): if this token is tracked in
+    // the sessions table, an explicit revocation (revokedAt) or expiry must
+    // take effect IMMEDIATELY — not only when the JWT itself would have
+    // expired. Tokens without a tracked row (e.g. cron sessions) keep relying
+    // on JWT verification alone.
+    if (sessionToken) {
+      const tracked = await db
+        .classifyPlatformSession(sessionToken)
+        .catch((error: unknown) => {
+          console.error("[Auth] Session revocation lookup failed:", error);
+          // DB blip during a revocation check: JWT validity was already
+          // established. Refuse to lock out every user because the audit DB
+          // hiccupped — continue and rely on JWT expiry in that case.
+          return { state: "UNTRACKED" as const };
+        });
+      if (tracked.state === "REVOKED") {
+        console.warn("[Auth] Session was revoked server-side; rejecting");
+        throw ForbiddenError("Session was revoked");
+      }
+      if (tracked.state === "EXPIRED") {
+        console.warn("[Auth] Session expired server-side; rejecting");
+        throw ForbiddenError("Session expired");
+      }
+    }
+
     if (session.openId.startsWith(CRON_OPEN_ID_PREFIX)) {
       const userInfo = await this.getUserInfoWithJwt(sessionToken ?? "");
       const taskUid = userInfo.taskUid ?? null;
@@ -318,6 +343,27 @@ class SDKServer {
 
     if (!user) {
       throw ForbiddenError("User not found");
+    }
+
+    // BUG-007 (QA #4): a revoked or suspended SAMPRAAN identity must lose its
+    // platform session privileges immediately, not only at the next token
+    // mint. The linked identity status is resolved from the database on every
+    // authenticated request; a revoked/suspended identity fails closed here.
+    const linkedIdentity = await db.getIdentityByLinkedUserId(user.id).catch((error: unknown) => {
+      console.error("[Auth] Identity status check failed:", error);
+      // Fail closed when the trust domain cannot be consulted: the read
+      // model being unavailable must not silently admit a possibly-revoked
+      // identity. (This only gates the SAMPRAAN identity binding — platform
+      // users with no binding at all remain unaffected, see the null check.)
+      throw ForbiddenError("Identity status could not be verified");
+    });
+    if (linkedIdentity && linkedIdentity.status !== "ACTIVE") {
+      console.warn(
+        `[Auth] Linked SAMPRAAN identity is ${linkedIdentity.status}; rejecting session for ${user.openId}`
+      );
+      throw ForbiddenError(
+        `Linked SAMPRAAN identity is ${linkedIdentity.status.toLowerCase()}`
+      );
     }
 
     await db.upsertUser({

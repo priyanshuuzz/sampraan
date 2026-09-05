@@ -1,0 +1,14 @@
+# SAMPRAAN pnpm workspace configuration.
+#
+# BUG-024 (QA finding #8): pnpm 10 no longer reads the "pnpm" field from
+# package.json — patchedDependencies and overrides were silently ignored,
+# which meant this wouter patch was NEVER applied in this project. pnpm 10
+# only reads these keys from pnpm-workspace.yaml.
+packages:
+  - .
+
+patchedDependencies:
+  wouter@3.7.1: patches/wouter@3.7.1.patch
+
+overrides:
+  tailwindcss>nanoid: 3.3.7

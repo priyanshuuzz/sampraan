@@ -65,6 +65,8 @@ function createService(): BlockchainServiceLike {
     getTransaction: hash => mock.getTransaction(hash),
     getEvents: () => mock.getEvents(),
   };
+  // Note: the mock chain has no events by construction; the input window is
+  // intentionally ignored in MOCK mode (an empty array is the truthful answer).
 }
 
 export const blockchainService: BlockchainServiceLike = createService();

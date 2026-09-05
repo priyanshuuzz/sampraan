@@ -11,8 +11,51 @@ import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
 import { getDb } from "../db";
 import { blockchainService } from "../modules/blockchain/blockchain.service";
+import { chainEventIndexer } from "../modules/blockchain/chain-event-indexer";
 import { corsPolicy, rateLimit, requestLogger, securityHeaders } from "../common/security";
 import { safeErrorHandler } from "../common/error-handler";
+
+/**
+ * BUG-004 (QA #2): the chain event indexer existed but was never invoked, so
+ * on-chain events never projected into the audit read model. This scheduler
+ * runs the indexer periodically whenever a real chain is connected. All
+ * failures are logged and retried on the next tick — indexing must never
+ * crash the API server.
+ */
+const INDEXER_INTERVAL_MS = 30_000;
+let indexerTimer: ReturnType<typeof setInterval> | null = null;
+
+function startIndexerLoop(): void {
+  if (indexerTimer) return;
+  indexerTimer = setInterval(() => {
+    void (async () => {
+      try {
+        const status = await blockchainService.getNetworkStatus();
+        if (!status.connected) return;
+        const result = await chainEventIndexer.indexRecentEvents();
+        if (result.indexed > 0) {
+          console.log(
+            `[Indexer] Projected ${result.indexed} new chain event(s) into the audit read model (skipped ${result.skipped}, latest block ${result.latestBlock})`
+          );
+        }
+      } catch (error) {
+        console.error(
+          "[Indexer] Chain event indexing failed:",
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    })();
+  }, INDEXER_INTERVAL_MS);
+  // Do not keep the process alive purely for the indexer.
+  indexerTimer.unref?.();
+}
+
+function stopIndexerLoop(): void {
+  if (indexerTimer) {
+    clearInterval(indexerTimer);
+    indexerTimer = null;
+  }
+}
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -90,7 +133,17 @@ async function startServer() {
 
   server.listen(port, () => {
     console.log(`Server running on http://localhost:${port}/`);
+    // Start projecting on-chain events into the audit read model (BUG-004).
+    startIndexerLoop();
   });
+
+  const shutdown = () => {
+    stopIndexerLoop();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 5000).unref();
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
 startServer().catch(console.error);

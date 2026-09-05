@@ -20,9 +20,6 @@ import {
   createAccessControlContract,
   createAssetRegistryContract,
   createIdentityRegistryContract,
-  SampraanAccessControlABI,
-  SampraanAssetRegistryABI,
-  SampraanIdentityRegistryABI,
 } from "./contracts";
 
 const root = path.resolve(import.meta.dirname, "..", "..", "..");

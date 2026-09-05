@@ -164,7 +164,10 @@ export const securityAlerts = mysqlTable("security_alerts", {
 export const sessions = mysqlTable("sessions", {
   id: uuid("id").primaryKey(),
   identityId: varchar("identityId", { length: 36 }).notNull().references(() => identities.id),
-  sessionId: varchar("sessionId", { length: 160 }).notNull().unique(),
+  // BUG-027: JWT session tokens (jose HS256, appId-bound claims) serialize to
+  // 250+ characters — a 160-char column silently made server-side session
+  // tracking impossible to ever store a real token. 512 gives ample margin.
+  sessionId: varchar("sessionId", { length: 512 }).notNull().unique(),
   expiresAt: timestamp("expiresAt").notNull(),
   revokedAt: timestamp("revokedAt"),
   createdAt: createdAt(),

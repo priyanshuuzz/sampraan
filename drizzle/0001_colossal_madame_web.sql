@@ -1,0 +1,1 @@
+ALTER TABLE `sessions` MODIFY COLUMN `sessionId` varchar(512) NOT NULL;

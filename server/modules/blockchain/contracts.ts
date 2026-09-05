@@ -10,12 +10,13 @@
 import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import { Contract, type InterfaceAbi, type Signer } from "ethers";
+import { resolveProjectRoot } from "./paths";
 
-const root = path.resolve(import.meta.dirname, "..", "..", "..");
-const artifactsDir = path.join(root, "blockchain", "artifacts");
+const artifactsDir = (): string =>
+  path.join(resolveProjectRoot(), "blockchain", "artifacts");
 
 function loadAbi(contractName: string): InterfaceAbi {
-  const filePath = path.join(artifactsDir, `${contractName}.json`);
+  const filePath = path.join(artifactsDir(), `${contractName}.json`);
   if (!existsSync(filePath)) {
     throw new Error(
       `Contract artifact ${contractName} not found. Run "pnpm run contracts:compile".`
@@ -24,9 +25,23 @@ function loadAbi(contractName: string): InterfaceAbi {
   return JSON.parse(readFileSync(filePath, "utf8")).abi as InterfaceAbi;
 }
 
-export const SampraanAccessControlABI = loadAbi("SampraanAccessControl");
-export const SampraanIdentityRegistryABI = loadAbi("SampraanIdentityRegistry");
-export const SampraanAssetRegistryABI = loadAbi("SampraanAssetRegistry");
+/**
+ * ABIs are loaded lazily (BUG-001 regression safety): a missing artifacts
+ * directory must only fail the blockchain features that actually need an ABI
+ * — never crash the whole server at import time in environments running
+ * without a compiled contract suite (e.g. MOCK-mode deployments, first boots).
+ */
+const lazyAbi = (name: string) => {
+  let abi: InterfaceAbi | null = null;
+  return () => {
+    if (!abi) abi = loadAbi(name);
+    return abi;
+  };
+};
+
+export const getSampraanAccessControlABI = lazyAbi("SampraanAccessControl");
+export const getSampraanIdentityRegistryABI = lazyAbi("SampraanIdentityRegistry");
+export const getSampraanAssetRegistryABI = lazyAbi("SampraanAssetRegistry");
 
 interface ContractLike {
   connect: (signer: Signer) => unknown;
@@ -196,19 +211,19 @@ export function createAccessControlContract(
   address: string,
   signer: Signer
 ): SampraanAccessControlHandle {
-  return new SampraanAccessControlHandle(address, SampraanAccessControlABI, signer);
+  return new SampraanAccessControlHandle(address, getSampraanAccessControlABI(), signer);
 }
 
 export function createIdentityRegistryContract(
   address: string,
   signer: Signer
 ): SampraanIdentityRegistryHandle {
-  return new SampraanIdentityRegistryHandle(address, SampraanIdentityRegistryABI, signer);
+  return new SampraanIdentityRegistryHandle(address, getSampraanIdentityRegistryABI(), signer);
 }
 
 export function createAssetRegistryContract(
   address: string,
   signer: Signer
 ): SampraanAssetRegistryHandle {
-  return new SampraanAssetRegistryHandle(address, SampraanAssetRegistryABI, signer);
+  return new SampraanAssetRegistryHandle(address, getSampraanAssetRegistryABI(), signer);
 }

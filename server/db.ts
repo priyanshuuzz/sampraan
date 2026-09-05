@@ -1,6 +1,7 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
+  assetCustody,
   assets,
   auditEvents,
   authorizationDecisions,
@@ -11,7 +12,10 @@ import {
   rolePermissions,
   roles,
   securityAlerts,
+  sessions,
   users,
+  type Asset,
+  type Identity,
   type InsertAsset,
   type InsertIdentity,
   type InsertUser,
@@ -231,4 +235,174 @@ export async function createDidRecord(input: Omit<typeof didRecords.$inferInsert
   await db.insert(didRecords).values({ ...input, id });
   const rows = await db.select().from(didRecords).where(eq(didRecords.id, id)).limit(1);
   return rows[0];
+}
+
+/**
+ * BUG-006: after a successful on-chain custody transfer the read model must
+ * reflect the new custodian, otherwise the DB and the chain disagree and the
+ * UI keeps showing the pre-transfer custodian. Also closes the previous
+ * custody row and opens a new one so the custody history stays accurate.
+ *
+ * Returns the updated asset, or null when the DB is unavailable (evidence is
+ * already on-chain; the caller records the mismatch as a FAILED audit event).
+ */
+export async function applyCustodyTransfer(input: {
+  assetRowId: string;
+  newCustodianIdentityId: string | null;
+  reason: string;
+  transactionHash?: string | null;
+  blockNumber?: number | null;
+}): Promise<Asset | null> {
+  const db = await getDb();
+  if (!db) return null;
+
+  await db.transaction(async tx => {
+    if (input.newCustodianIdentityId) {
+      await tx
+        .update(assets)
+        .set({ custodianIdentityId: input.newCustodianIdentityId })
+        .where(eq(assets.id, input.assetRowId));
+    }
+    // Close the currently open custody row (if the table has one) and open a
+    // new row for the incoming custodian.
+    await tx
+      .update(assetCustody)
+      .set({ endedAt: new Date() })
+      .where(and(eq(assetCustody.assetId, input.assetRowId), isNull(assetCustody.endedAt)));
+    if (input.newCustodianIdentityId) {
+      await tx.insert(assetCustody).values({
+        id: crypto.randomUUID(),
+        assetId: input.assetRowId,
+        custodianIdentityId: input.newCustodianIdentityId,
+        reason: input.reason,
+      });
+    }
+  });
+
+  const rows = await db.select().from(assets).where(eq(assets.id, input.assetRowId)).limit(1);
+  return rows[0] ?? null;
+}
+
+/**
+ * BUG-007 support: mark an identity SUSPENDED/REVOKED in the read model and
+ * keep derived records consistent (DID record status, revokedAt timestamps).
+ * Returns the updated identity or null when the DB is unavailable.
+ */
+export async function applyIdentityStatusChange(input: {
+  identityId: string;
+  status: "ACTIVE" | "SUSPENDED" | "REVOKED";
+}): Promise<Identity | null> {
+  const db = await getDb();
+  if (!db) return null;
+
+  const revokedAt = input.status === "REVOKED" ? new Date() : null;
+  await db
+    .update(identities)
+    .set({
+      status: input.status,
+      ...(revokedAt ? { revokedAt } : {}),
+    })
+    .where(eq(identities.id, input.identityId));
+
+  // Keep the DID record lifecycle in sync (a revoked identity must not keep
+  // an ACTIVE DID document).
+  const identityRows = await db.select().from(identities).where(eq(identities.id, input.identityId)).limit(1);
+  const identity = identityRows[0];
+  if (identity?.did) {
+    await db
+      .update(didRecords)
+      .set({
+        status: input.status === "ACTIVE" ? "ACTIVE" : "REVOKED",
+        ...(input.status !== "ACTIVE" ? { revokedAt: new Date() } : {}),
+      })
+      .where(eq(didRecords.did, identity.did));
+  }
+
+  return identity ?? null;
+}
+
+/**
+ * BUG-028: assets created through the API default to PENDING and previously
+ * had NO transition path to ACTIVE — every API-created asset was permanently
+ * untransferable. Admin-driven lifecycle change for the read model.
+ */
+export async function applyAssetStatusChange(input: {
+  assetRowId: string;
+  status: "ACTIVE" | "REVOKED" | "PENDING";
+}): Promise<Asset | null> {
+  const db = await getDb();
+  if (!db) return null;
+  await db
+    .update(assets)
+    .set({ status: input.status })
+    .where(eq(assets.id, input.assetRowId));
+  const rows = await db.select().from(assets).where(eq(assets.id, input.assetRowId)).limit(1);
+  return rows[0] ?? null;
+}
+
+/**
+ * BUG-030: the chain-event indexer deduplicated only against an in-memory
+ * Set, so every process restart re-projected the same chain events and
+ * duplicated audit rows (observed live: one tx anchored 4 times). This
+ * returns the set of transaction hashes already recorded from the chain so
+ * the indexer can skip them durably, across restarts.
+ */
+export async function listIndexedChainTxHashes(): Promise<Set<string>> {
+  const db = await getDb();
+  if (!db) return new Set();
+  const rows = await db
+    .select({ transactionHash: auditEvents.transactionHash })
+    .from(auditEvents)
+    .where(and(eq(auditEvents.source, "CHAIN_READ_MODEL"), isNotNull(auditEvents.transactionHash)));
+  return new Set(rows.map(r => r.transactionHash).filter((h): h is string => Boolean(h)));
+}
+
+/**
+ * QA #5 (server-side session revocation): given a session token, classify
+ * its server-side tracking state. DISTINCT outcomes matter:
+ *  - "UNTRACKED"  — no row exists for this token (e.g. cron sessions,
+ *    tokens minted before tracking began): JWT verification governs alone.
+ *  - "ACTIVE"     — tracked, not revoked, not expired: the session stands.
+ *  - "REVOKED"   — an administrator revoked it server-side: reject NOW,
+ *    regardless of the JWT's own expiry.
+ *  - "EXPIRED"   — the tracked row's expiry has passed: reject NOW.
+ */
+export type PlatformSessionState =
+  | { state: "UNTRACKED" }
+  | { state: "ACTIVE"; id: string; identityId: string; expiresAt: Date }
+  | { state: "REVOKED" }
+  | { state: "EXPIRED" };
+
+export async function classifyPlatformSession(sessionToken: string): Promise<PlatformSessionState> {
+  const db = await getDb();
+  if (!db) return { state: "UNTRACKED" };
+  const rows = await db
+    .select({
+      id: sessions.id,
+      identityId: sessions.identityId,
+      expiresAt: sessions.expiresAt,
+      revokedAt: sessions.revokedAt,
+    })
+    .from(sessions)
+    .where(eq(sessions.sessionId, sessionToken))
+    .limit(1);
+  const row = rows[0];
+  if (!row) return { state: "UNTRACKED" };
+  if (row.revokedAt) return { state: "REVOKED" };
+  if (row.expiresAt.getTime() <= Date.now()) return { state: "EXPIRED" };
+  return { state: "ACTIVE", id: row.id, identityId: row.identityId, expiresAt: row.expiresAt };
+}
+
+/**
+ * Revoke a tracked platform session server-side (admin action). Returns
+ * true when a row was revoked, false when the token is not tracked.
+ */
+export async function revokePlatformSession(sessionToken: string): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  const result = await db
+    .update(sessions)
+    .set({ revokedAt: new Date() })
+    .where(and(eq(sessions.sessionId, sessionToken), isNull(sessions.revokedAt)));
+  return (result as unknown as { affectedRows?: number }).affectedRows !== 0;
 }
