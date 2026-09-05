@@ -132,7 +132,7 @@ export const appRouter = router({
      * privileges from any session bound to a REVOKED/SUSPENDED identity
      * (BUG-007 / QA #4).
      */
-    setStatus: adminProcedure.input(z.object({ identityId: z.string().uuid(), status: identityStatus })).mutation(async ({ input }) => {
+    setStatus: adminProcedure.input(z.object({ identityId: z.string().uuid(), status: identityStatus })).mutation(async ({ input, ctx }) => {
       const identity = await getIdentityById(input.identityId);
       if (!identity) throw new TRPCError({ code: "NOT_FOUND", message: "Identity not found" });
       if (identity.status === input.status) {
@@ -192,15 +192,21 @@ export const appRouter = router({
         }
       }
 
+      // SECURITY: audit evidence must attribute the ACTING administrator —
+      // resolved server-side from the session — never the target identity.
+      // (The previous implementation recorded actorIdentityId = identity.id,
+      //  i.e. the identity whose status changed, so a revocation looked like a
+      //  self-revocation in the evidence trail.)
+      const actingAdminIdentity = ctx.user ? await getIdentityByLinkedUserId(ctx.user.id) : undefined;
       await createAuditEvent({
-        actorIdentityId: identity.id,
+        actorIdentityId: actingAdminIdentity?.id ?? null,
         action: input.status === "REVOKED" ? "IDENTITY_REVOKED" : input.status === "SUSPENDED" ? "IDENTITY_SUSPENDED" : "IDENTITY_REACTIVATED",
         resourceType: "IDENTITY",
         resourceId: identity.id,
         decision: "ALLOW",
         reason: `Identity status set to ${input.status} by an administrator`,
         transactionHash: anchor?.outcome === "ANCHORED" ? anchor.reason ?? null : null,
-        metadata: { source: "identity-administration", previousStatus: identity.status, newStatus: input.status, anchorOutcome: anchor?.outcome ?? "SKIPPED" },
+        metadata: { source: "identity-administration", previousStatus: identity.status, newStatus: input.status, anchorOutcome: anchor?.outcome ?? "SKIPPED", targetIdentityId: identity.id, actorUserOpenId: ctx.user?.openId ?? null, actorUserRole: ctx.user?.role ?? null },
       }).catch(() => { /* evidence best-effort */ });
 
       return { ...(updated ?? identity), changed: true as const, anchor };
@@ -238,7 +244,7 @@ export const appRouter = router({
      * status and mirrors the lifecycle on-chain (ACTIVATE/SUSPEND/RESTORE/
      * REVOKE) when a real chain is configured, with full audit evidence.
      */
-    setStatus: adminProcedure.input(z.object({ assetId: z.string().uuid(), status: assetStatus })).mutation(async ({ input }) => {
+    setStatus: adminProcedure.input(z.object({ assetId: z.string().uuid(), status: assetStatus })).mutation(async ({ input, ctx }) => {
       const asset = await getAssetById(input.assetId);
       if (!asset) throw new TRPCError({ code: "NOT_FOUND", message: "Asset not found" });
       if (asset.status === input.status) {
@@ -269,15 +275,18 @@ export const appRouter = router({
         }
       }
 
+      // SECURITY: attribute the ACTING administrator, resolved server-side
+      // from the session — never null and never the resource owner.
+      const actingAdminIdentity = ctx.user ? await getIdentityByLinkedUserId(ctx.user.id) : undefined;
       await createAuditEvent({
-        actorIdentityId: null,
+        actorIdentityId: actingAdminIdentity?.id ?? null,
         action: input.status === "ACTIVE" ? "ASSET_ACTIVATED" : input.status === "REVOKED" ? "ASSET_REVOKED" : "ASSET_SUSPENDED",
         resourceType: "ASSET",
         resourceId: asset.assetId,
         decision: "ALLOW",
         reason: `Asset status set to ${input.status} by an administrator`,
         transactionHash: anchor?.outcome === "ANCHORED" ? anchor.reason ?? null : null,
-        metadata: { source: "asset-administration", previousStatus: asset.status, newStatus: input.status, anchorOutcome: anchor?.outcome ?? "SKIPPED" },
+        metadata: { source: "asset-administration", previousStatus: asset.status, newStatus: input.status, anchorOutcome: anchor?.outcome ?? "SKIPPED", actorUserOpenId: ctx.user?.openId ?? null, actorUserRole: ctx.user?.role ?? null },
       }).catch(() => { /* evidence best-effort */ });
 
       return { ...(updated ?? asset), changed: true as const, anchor };
