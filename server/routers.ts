@@ -150,11 +150,25 @@ export const appRouter = router({
               did: identity.did,
               displayName: identity.displayName,
             });
-            const evidence = await besuBlockchainService.setIdentityStatus({
-              walletAddress,
-              status: input.status,
-            });
-            anchor = { outcome: "ANCHORED", reason: evidence.transactionHash };
+            try {
+              const evidence = await besuBlockchainService.setIdentityStatus({
+                walletAddress,
+                status: input.status,
+              });
+              anchor = { outcome: "ANCHORED", reason: evidence.transactionHash };
+            } catch (statusError) {
+              const reason = statusError instanceof Error ? statusError.message : String(statusError);
+              // BUG-031: the contract reverts SameStatus() (0x24904fe5) when
+              // the on-chain status already equals the target — e.g. after a
+              // prior chain call failed and the DB/chain drifted, or a
+              // re-assertion of the same lifecycle state. An already-in-sync
+              // chain is the DESIRED end state, not a failure.
+              if (reason.includes("0x24904fe5") || /same status/i.test(reason)) {
+                anchor = { outcome: "SKIPPED", reason: "On-chain status already matches the requested status" };
+              } else {
+                throw statusError;
+              }
+            }
           }
         } catch (error) {
           anchor = {
@@ -408,6 +422,34 @@ export const appRouter = router({
         });
         throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Blockchain custodian wallet is not configured" });
       }
+      // BUG-032: when the asset's on-chain custodian is ALREADY the acting
+      // identity's wallet (e.g. re-running the SIH demo transfer twice), the
+      // contract correctly reverts SameAssetStatus() (0x27479240). That is
+      // not a failure — the requested custody state already holds on-chain.
+      // Read the chain state and short-circuit with an evidence-backed
+      // "already in custody" result instead of a confusing BAD_GATEWAY error.
+      if (besuBlockchainService && toCustodianWallet) {
+        const onChainAsset = await besuBlockchainService
+          .getAsset(asset.assetId)
+          .catch(() => null);
+        if (onChainAsset && onChainAsset.custodian.toLowerCase() === toCustodianWallet.toLowerCase()) {
+          await createAuditEvent({
+            actorIdentityId: actorIdentity?.id ?? null,
+            action: "ASSET_CUSTODY_UNCHANGED",
+            resourceType: "ASSET",
+            resourceId: asset.assetId,
+            decision: "ALLOW",
+            reason: "Requested custodian already holds custody on-chain",
+            metadata: { source: "blockchain-evidence", custodianWallet: toCustodianWallet, chainMode: blockchainService.mode, ...actingUser },
+          }).catch(() => { /* best-effort evidence */ });
+          return {
+            ...result,
+            reason: "Requested custodian already holds custody on-chain — no transfer needed",
+            transaction: null,
+            custodyUnchanged: true as const,
+          };
+        }
+      }
       let transaction;
       try {
         transaction = await blockchainService.submitTransaction({
@@ -419,6 +461,26 @@ export const appRouter = router({
         // The authorization decision is evidence and is recorded alongside a
         // BLOCKCHAIN_TRANSACTION_FAILED audit event with the failure reason.
         const reason = error instanceof Error ? error.message : String(error);
+        // BUG-032 (race safety): if the custodian moved between our read and
+        // the submit, SameAssetStatus() still means "already in the requested
+        // custody" — return the honest unchanged state, not an error.
+        if (reason.includes("0x27479240") || /same asset status/i.test(reason)) {
+          await createAuditEvent({
+            actorIdentityId: actorIdentity?.id ?? null,
+            action: "ASSET_CUSTODY_UNCHANGED",
+            resourceType: "ASSET",
+            resourceId: asset.assetId,
+            decision: "ALLOW",
+            reason: "Requested custodian already holds custody on-chain",
+            metadata: { source: "blockchain-evidence", custodianWallet: toCustodianWallet, ...actingUser },
+          }).catch(() => { /* best-effort evidence */ });
+          return {
+            ...result,
+            reason: "Requested custodian already holds custody on-chain — no transfer needed",
+            transaction: null,
+            custodyUnchanged: true as const,
+          };
+        }
         await createAuditEvent({
           actorIdentityId: actorIdentity?.id ?? null,
           action: "BLOCKCHAIN_TRANSACTION_FAILED",
