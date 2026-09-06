@@ -85,6 +85,14 @@ async function startServer() {
   const server = createServer(app);
   // Do not advertise the framework in responses.
   app.disable("x-powered-by");
+  // Behind a reverse proxy (nginx, a load balancer), req.ip would otherwise
+  // be the PROXY's address: every client shares one rate-limit bucket (a
+  // collective limit — safe but availability-hostile). TRUST_PROXY=1 opts in
+  // to X-Forwarded-For resolution; it must be set ONLY when an actual proxy
+  // fronts the app, otherwise clients could spoof their rate-limit identity.
+  if (process.env.TRUST_PROXY === "1") {
+    app.set("trust proxy", 1);
+  }
   app.use(securityHeaders);
   app.use(corsPolicy);
   app.use(rateLimit());
