@@ -155,6 +155,12 @@ production — the deploy script explicitly refuses them under
 
 - Rate limiting is in-process memory; behind multiple replicas, each node
   keeps its own buckets (documented limitation for single-node RC).
+- Rate limiting is keyed by client IP. Behind a reverse proxy, set
+  `TRUST_PROXY=1` so the limiter keys on `X-Forwarded-For` — without it,
+  every client behind the proxy shares one collective bucket (safe, but
+  one abusive client can exhaust it for everyone). Only enable it when a
+  proxy actually fronts the app: with direct exposure it would let
+  clients spoof their rate-limit identity.
 - Session revocation is per-database; all app replicas share it via MySQL.
 - The 30s indexer interval means chain events appear in the audit read
   model with up to 30s lag (evidence itself is immediate on-chain).
