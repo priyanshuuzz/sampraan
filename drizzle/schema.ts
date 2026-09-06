@@ -93,7 +93,13 @@ export const assets = mysqlTable("assets", {
   assetId: varchar("assetId", { length: 120 }).notNull().unique(),
   name: varchar("name", { length: 200 }).notNull(),
   type: varchar("type", { length: 80 }).notNull(),
-  classification: varchar("classification", { length: 80 }).notNull(),
+  // DEFENSE IN DEPTH (adversarial review): the classification drives
+  // POLICY-HIGH-SENS-TRANSFER / POLICY-STEP-UP. The tRPC input schema is
+  // already an enum, but the DATABASE column must also refuse values outside
+  // the 5 blessed classifications so no write path (future admin tooling, a
+  // forgotten validator, direct SQL) can smuggle an unknown classification
+  // past the policy engine.
+  classification: mysqlEnum("classification", ["PUBLIC", "CONTROLLED", "SENSITIVE", "HIGHLY_SENSITIVE", "CRITICAL"]).notNull(),
   description: text("description"),
   ownerIdentityId: varchar("ownerIdentityId", { length: 36 }).notNull().references(() => identities.id),
   custodianIdentityId: varchar("custodianIdentityId", { length: 36 }).notNull().references(() => identities.id),
