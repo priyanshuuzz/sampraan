@@ -101,10 +101,15 @@ async function startServer() {
     res.json({ api: "OK", database: db ? "CONNECTED" : "NOT_CONFIGURED", blockchain });
   });
   app.get("/ready", async (_req, res) => {
+    // Readiness gates on the DATABASE only: the chain layer is deliberately
+    // best-effort (anchoring never blocks identity/asset operations), so a
+    // chain outage must not drain the service from the load balancer.
+    // Chain status is still REPORTED (bounded by the RPC timeout) for
+    // diagnostics, but it does not flip readiness.
     const db = await getDb();
-    const blockchain = await blockchainService.getNetworkStatus();
     const ready = Boolean(db);
-    res.status(ready ? 200 : 503).json({ ready, database: db ? "CONNECTED" : "NOT_CONFIGURED", blockchain });
+    const blockchain = await blockchainService.getNetworkStatus().catch(() => null);
+    res.status(ready ? 200 : 503).json({ ready, database: db ? "CONNECTED" : "NOT_CONNECTED", blockchain });
   });
   registerStorageProxy(app);
   registerOAuthRoutes(app);

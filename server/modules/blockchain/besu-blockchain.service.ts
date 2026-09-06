@@ -51,6 +51,35 @@ import type {
 
 const IDENTITY_STATUS_CODES = { ACTIVE: 1, SUSPENDED: 2, REVOKED: 3 } as const;
 
+/**
+ * Upper bound for any single RPC round-trip used by health/status surfaces.
+ * A HUNG validator (paused container, network partition, grey failure)
+ * otherwise blocks /health, /ready and every chain-touching request for
+ * the provider default timeout (60s+). Degraded state must be reported in
+ * seconds, not minutes.
+ */
+const STATUS_RPC_TIMEOUT_MS = 5_000;
+
+/** Reject with a clear error after ms. */
+function withTimeout<T>(task: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(what + " timed out after " + ms + "ms (chain RPC unresponsive)")),
+      ms
+    );
+    task.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
 export class BesuBlockchainService {
   readonly config: BlockchainConfig;
   private provider: JsonRpcProvider | null = null;
@@ -125,15 +154,21 @@ export class BesuBlockchainService {
 
   async getNetworkStatus(): Promise<NetworkStatus> {
     try {
-      await this.ensureInitialized();
+      // Bounded: a hung RPC must degrade to connected:false within seconds,
+      // never stall the health/readiness surface for the provider default.
+      await withTimeout(this.ensureInitialized(), STATUS_RPC_TIMEOUT_MS, "chain initialization");
       const provider = this.provider!;
-      const [blockNumber, network, clientVersion] = await Promise.all([
-        provider.getBlockNumber(),
-        provider.getNetwork(),
-        provider
-          .send("web3_clientVersion", [])
-          .catch(() => undefined) as Promise<string | undefined>,
-      ]);
+      const [blockNumber, network, clientVersion] = await withTimeout(
+        Promise.all([
+          provider.getBlockNumber(),
+          provider.getNetwork(),
+          provider
+            .send("web3_clientVersion", [])
+            .catch(() => undefined) as Promise<string | undefined>,
+        ]),
+        STATUS_RPC_TIMEOUT_MS,
+        "chain status query"
+      );
       return {
         connected: true,
         mode: "BESU",
