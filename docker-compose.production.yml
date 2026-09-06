@@ -1,0 +1,96 @@
+# SAMPRAAN production composition: application + MySQL.
+#
+# The Besu QBFT validator network is managed SEPARATELY via
+#   blockchain/network/docker-compose.yml
+# (validators are infrastructure with their own lifecycle and key
+#  rotation procedure; coupling their restarts to app deploys would
+#  unnecessarily destabilize consensus.)
+#
+# Deploy:
+#   1. Start the chain:      pnpm run blockchain:start
+#   2. Deploy contracts:     BLOCKCHAIN_PRIVATE_KEY=<operator> pnpm run blockchain:deploy
+#   3. Bring up app + db:    docker compose -f docker-compose.production.yml up -d
+#   4. Apply migrations:     docker compose -f docker-compose.production.yml exec app pnpm drizzle-kit migrate
+#                            (or: docker compose ... run --rm app node dist/migrate.js — see docs/operations.md)
+#   5. Seed roles/policies:  scripts are dev-only; production provisions via the admin API.
+#
+# Configuration: everything comes from the environment (.env is NOT baked
+# into the image). See .env.example for the full variable list.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sampraan-app:rc
+    container_name: sampraan-app
+    restart: unless-stopped
+    env_file:
+      - .env            # never committed; see .env.example
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # Inside compose the DB host is the service name, not localhost.
+      DATABASE_URL: mysql://${MYSQL_USER:-sampraan}:${MYSQL_PASSWORD:?set MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-sampraan}
+      # The Besu network publishes RPC on the host; the app joins the chain
+      # network so it can also address validators directly.
+      BLOCKCHAIN_RPC_URL: ${BLOCKCHAIN_RPC_URL:-http://sampraan-validator-1:8545}
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - sampraan-chain
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  mysql:
+    image: mysql:8.4
+    container_name: sampraan-mysql-prod
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-sampraan}
+      MYSQL_USER: ${MYSQL_USER:-sampraan}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD}
+    volumes:
+      - sampraan-mysql-data:/var/lib/mysql
+      - ./scripts/ops/mysql-backup.cnf:/etc/mysql/conf.d/mysql-backup.cnf:ro
+    command:
+      - --log-bin-trust-function-creators=1
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - internal
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  sampraan-mysql-data:
+
+networks:
+  # External network published by blockchain/network/docker-compose.yml
+  # (network name: sampraan-chain, subnet 172.28.0.0/16).
+  sampraan-chain:
+    external: true
+    name: sampraan-chain
+  internal:
+    driver: bridge

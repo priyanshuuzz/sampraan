@@ -1,10 +1,14 @@
-import { jsxLocPlugin } from "@builder.io/vite-plugin-jsx-loc";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import fs from "node:fs";
 import path from "node:path";
 import { defineConfig, type Plugin, type ViteDevServer } from "vite";
-import { vitePluginManusRuntime } from "vite-plugin-manus-runtime";
+// QA #9 + production-image slimness: the Manus sandbox harness plugins
+// (@builder.io/vite-plugin-jsx-loc, vite-plugin-manus-runtime) are
+// DEV-ONLY devDependencies. Static top-level imports would be linked into
+// any bundle that inlines this config (the server's dev-mode Vite setup)
+// and crash a slim production install with ERR_MODULE_NOT_FOUND. They are
+// loaded dynamically below and only when running the dev server.
 
 // =============================================================================
 // Manus Debug Collector - Vite Plugin
@@ -156,15 +160,26 @@ function vitePluginManusDebugCollector(): Plugin {
 // real deployment never uses. `vite build` always runs with mode=production,
 // `vite dev` with mode=development, so filter on mode (not NODE_ENV).
 const isDev = process.argv[2] !== "build";
-const plugins = [
-  react(),
-  tailwindcss(),
-  ...(isDev ? [jsxLocPlugin(), vitePluginManusRuntime()] : []),
-  vitePluginManusDebugCollector(),
-];
 
-export default defineConfig({
-  plugins,
+export default defineConfig(async () => {
+  // Dev-only harness plugins load dynamically (see import note at the top)
+  // so a production bundle never links dev-only devDependencies.
+  const devHarnessPlugins: Plugin[] = isDev
+    ? [
+        (await import("@builder.io/vite-plugin-jsx-loc")).jsxLocPlugin(),
+        (await import("vite-plugin-manus-runtime")).vitePluginManusRuntime(),
+      ]
+    : [];
+
+  const plugins = [
+    react(),
+    tailwindcss(),
+    ...devHarnessPlugins,
+    vitePluginManusDebugCollector(),
+  ];
+
+  return {
+    plugins,
   resolve: {
     alias: {
       "@": path.resolve(import.meta.dirname, "client", "src"),
@@ -195,4 +210,5 @@ export default defineConfig({
       deny: ["**/.*"],
     },
   },
+  };
 });

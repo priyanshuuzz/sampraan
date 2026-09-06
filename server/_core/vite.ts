@@ -1,12 +1,43 @@
 import express, { type Express } from "express";
 import fs from "fs";
 import { type Server } from "http";
-import { nanoid } from "nanoid";
 import path from "path";
-import { createServer as createViteServer } from "vite";
-import viteConfig from "../../vite.config";
+
+/**
+ * Development-only Vite middleware + production static serving.
+ *
+ * The `vite` package and the vite config (which pulls in the dev plugin
+ * chain) are devDependencies: importing them statically would force the
+ * production runtime image to ship the whole dev toolchain (and crash in
+ * slim installs, ERR_MODULE_NOT_FOUND). Both are therefore imported
+ * dynamically INSIDE setupVite(), which the server only calls when
+ * NODE_ENV=development. The production path (serveStatic) has no dev
+ * imports at all.
+ */
 
 export async function setupVite(app: Express, server: Server) {
+  // Dynamic: dev-only imports, never evaluated in production.
+  // nanoid v6 is ESM: the named export lives on the module namespace.
+  // The vite config is loaded through an opaque specifier (computed at
+  // runtime) so esbuild does NOT inline it into the production bundle —
+  // inlining would force the production runtime to link the config's
+  // build/dev toolchain (@tailwindcss/vite, @vitejs/plugin-react, ...).
+  const configSpec = new URL("../../vite.config.ts", import.meta.url)
+    .href;
+  const [{ createServer: createViteServer }, nanoidMod, viteConfigMod] =
+    await Promise.all([
+      import("vite"),
+      import("nanoid"),
+      import(configSpec) as Promise<{ default: unknown }>,
+    ]);
+  const nanoid = nanoidMod.nanoid as () => string;
+  // vite.config.ts exports defineConfig(...) whose default is the config
+  // (possibly a promise when the config function is async).
+  const viteConfig: Record<string, unknown> =
+    typeof viteConfigMod.default === "function"
+      ? ((await (viteConfigMod.default as () => Promise<unknown> | unknown)()) as Record<string, unknown>)
+      : (viteConfigMod.default as Record<string, unknown>);
+
   const serverOptions = {
     middlewareMode: true,
     hmr: { server },
@@ -37,7 +68,7 @@ export async function setupVite(app: Express, server: Server) {
       let template = await fs.promises.readFile(clientTemplate, "utf-8");
       template = template.replace(
         `src="/src/main.tsx"`,
-        `src="/src/main.tsx?v=${nanoid()}"`
+        `src="/src/main.tsx?v=${nanoid()}`
       );
       const page = await vite.transformIndexHtml(url, template);
       res.status(200).set({ "Content-Type": "text/html" }).end(page);

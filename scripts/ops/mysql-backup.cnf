@@ -1,0 +1,6 @@
+# MySQL server settings for reliable backups (mounted read-only).
+[mysqld]
+# Binary logging keeps restore-time point-in-time recovery possible.
+log_bin = /var/lib/mysql/mysql-bin
+binlog_format = ROW
+expire_logs_days = 7

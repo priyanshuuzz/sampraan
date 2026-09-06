@@ -20,7 +20,7 @@ Blockchain Transaction (QBFT consensus, 4 validators)
         ↓
 Event (IdentityRegistered, AssetTransferred, ...)
         ↓
-Audit / Indexer / Read Model (PostgreSQL audit_events, source: CHAIN_READ_MODEL)
+Audit / Indexer / Read Model (MySQL audit_events, source: CHAIN_READ_MODEL)
 ```
 
 ### Division of responsibility
@@ -28,7 +28,7 @@ Audit / Indexer / Read Model (PostgreSQL audit_events, source: CHAIN_READ_MODEL)
 | Layer | Role |
 |---|---|
 | **Blockchain (Besu/QBFT)** | Authoritative state-transition and provenance evidence layer. Anchors identity lifecycle status and controlled asset custody as tamper-evident on-chain records. |
-| **PostgreSQL** | Application/read model. Full application data, DID documents, asset metadata, audit query projections. The database is NOT moved on-chain. |
+| **MySQL 8** | Application/read model. Full application data, DID documents, asset metadata, audit query projections. The database is NOT moved on-chain. |
 | **Off-chain storage** | Sensitive documents, firmware binaries, PII. Only keccak256 digests are stored on-chain. |
 
 ## Why Besu + QBFT

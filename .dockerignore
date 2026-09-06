@@ -1,0 +1,27 @@
+# Keep the build context minimal: Docker builds must never send
+# node_modules, local chain data, logs, or secrets to the daemon.
+node_modules
+**/node_modules
+dist
+.manus-logs
+logs
+*.log
+.env
+.env.local
+.env.*.local
+backups
+.git
+.gitignore
+.idea
+.vscode
+coverage
+blockchain/network/nodedata
+blockchain/network/generated/keys
+*.db
+*.sqlite
+test-run-baseline.log
+docs
+scripts/frontend-verify.py
+scripts/ui-flow-a.py
+# The chain network config is runtime infra, not app build context.
+blockchain/network
