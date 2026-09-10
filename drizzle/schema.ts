@@ -12,6 +12,14 @@ export const users = mysqlTable("users", {
   email: varchar("email", { length: 320 }),
   loginMethod: varchar("loginMethod", { length: 64 }),
   role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
+  /**
+   * LOCAL AUTH (development/team demonstration):
+   * scrypt password hash ("scrypt$N$r$p$salt$hash", base64url components) for
+   * accounts provisioned by the dev seed. OAuth remains the production auth
+   * path; local accounts are created ONLY through the seed/admin tooling,
+   * never self-service, and always with server-side hashing.
+   */
+  passwordHash: varchar("passwordHash", { length: 255 }),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   lastSignedIn: timestamp("lastSignedIn").defaultNow().notNull(),
