@@ -12,6 +12,7 @@
     "test": "vitest run",
     "db:push": "drizzle-kit generate && drizzle-kit migrate",
     "seed:demo": "node server/seed-demo.mjs",
+    "verify:acceptance": "node server/verify-acceptance.mjs",
     "contracts:compile": "tsx scripts/compile-contracts.ts",
     "blockchain:deploy": "tsx scripts/deploy-contracts.ts",
     "blockchain:start": "docker compose -f blockchain/network/docker-compose.yml up -d",
