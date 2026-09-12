@@ -80,7 +80,7 @@ function signedInUser(overrides: Record<string, unknown> = {}) {
     openId: "user-open-id",
     name: "Aarav Mehta",
     email: "aarav@example.com",
-    loginMethod: "manus",
+    loginMethod: "local",
     role: "user",
     createdAt: new Date(),
     updatedAt: new Date(),

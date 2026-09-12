@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { bigint, boolean, index, int, json, mysqlEnum, mysqlTable, primaryKey, text, timestamp, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
 
 /**
- * Managed template auth user. This table is retained for Manus OAuth and is
+ * Managed template auth user. This table is retained for the OAuth sync flow and is
  * deliberately separate from SAMPRAAN's cryptographic identity model.
  */
 export const users = mysqlTable("users", {
@@ -12,6 +12,14 @@ export const users = mysqlTable("users", {
   email: varchar("email", { length: 320 }),
   loginMethod: varchar("loginMethod", { length: 64 }),
   role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
+  /**
+   * LOCAL AUTH (development/team demonstration):
+   * scrypt password hash ("scrypt$N$r$p$salt$hash", base64url components) for
+   * accounts provisioned by the dev seed. OAuth remains the production auth
+   * path; local accounts are created ONLY through the seed/admin tooling,
+   * never self-service, and always with server-side hashing.
+   */
+  passwordHash: varchar("passwordHash", { length: 255 }),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   lastSignedIn: timestamp("lastSignedIn").defaultNow().notNull(),
@@ -197,9 +205,60 @@ export const didRecords = mysqlTable("did_records", {
   subject: varchar("subject", { length: 255 }).notNull(),
   document: json("document"),
   status: mysqlEnum("status", ["ACTIVE", "REVOKED"]).default("ACTIVE").notNull(),
+  // Key lifecycle (LOOP 3): ACTIVE = current signing key; ROTATED = superseded
+  // key that must not authenticate where policy requires the current key;
+  // REVOKED = permanently unusable. Additive column — existing rows default ACTIVE.
+  keyStatus: mysqlEnum("keyStatus", ["ACTIVE", "ROTATED", "REVOKED"]).default("ACTIVE").notNull(),
+  rotatedAt: timestamp("rotatedAt"),
   createdAt: createdAt(),
   revokedAt: timestamp("revokedAt"),
 }, table => ({ identityIdx: index("did_records_identity_idx").on(table.identityId) }));
 
 export type DidRecord = typeof didRecords.$inferSelect;
 export type InsertDidRecord = typeof didRecords.$inferInsert;
+
+/** Single-use DID authentication challenges (LOOP 2). Nonce is stored hashed-at-rest never: this is a local demo store, but the row is consumed atomically and expires fast. */
+export const didChallenges = mysqlTable("did_challenges", {
+  id: uuid("id").primaryKey(),
+  did: varchar("did", { length: 255 }).notNull(),
+  nonce: varchar("nonce", { length: 128 }).notNull().unique(),
+  message: text("message").notNull(),
+  expiresAt: timestamp("expiresAt").notNull(),
+  consumedAt: timestamp("consumedAt"),
+  createdAt: createdAt(),
+}, table => ({ didIdx: index("did_challenges_did_idx").on(table.did) }));
+
+export type DidChallenge = typeof didChallenges.$inferSelect;
+export type InsertDidChallenge = typeof didChallenges.$inferInsert;
+
+/** Server-verified step-up sessions (LOOP 5). A CHALLENGE policy decision is only satisfied by a consumed, unexpired step-up row. */
+export const stepUpSessions = mysqlTable("step_up_sessions", {
+  id: uuid("id").primaryKey(),
+  identityId: varchar("identityId", { length: 36 }).notNull().references(() => identities.id),
+  purpose: varchar("purpose", { length: 120 }).notNull(),
+  nonce: varchar("nonce", { length: 128 }).notNull().unique(),
+  expiresAt: timestamp("expiresAt").notNull(),
+  consumedAt: timestamp("consumedAt"),
+  createdAt: createdAt(),
+}, table => ({ identityIdx: index("step_up_identity_idx").on(table.identityId) }));
+
+export type StepUpSession = typeof stepUpSessions.$inferSelect;
+export type InsertStepUpSession = typeof stepUpSessions.$inferInsert;
+
+/** Application-level approval for sensitive operations (LOOP 6). A REJECTED or missing approval MUST gate the blockchain operation; execution revalidates everything. */
+export const assetApprovals = mysqlTable("asset_approvals", {
+  id: uuid("id").primaryKey(),
+  assetId: varchar("assetId", { length: 36 }).notNull().references(() => assets.id),
+  requesterIdentityId: varchar("requesterIdentityId", { length: 36 }).notNull().references(() => identities.id),
+  approverIdentityId: varchar("approverIdentityId", { length: 36 }).references(() => identities.id),
+  action: varchar("action", { length: 100 }).notNull(),
+  targetIdentityId: varchar("targetIdentityId", { length: 36 }).references(() => identities.id),
+  status: mysqlEnum("status", ["PENDING", "APPROVED", "REJECTED", "EXECUTED"]).default("PENDING").notNull(),
+  reason: varchar("reason", { length: 300 }),
+  createdAt: createdAt(),
+  decidedAt: timestamp("decidedAt"),
+  executedAt: timestamp("executedAt"),
+}, table => ({ assetIdx: index("asset_approvals_asset_idx").on(table.assetId), statusIdx: index("asset_approvals_status_idx").on(table.status) }));
+
+export type AssetApproval = typeof assetApprovals.$inferSelect;
+export type InsertAssetApproval = typeof assetApprovals.$inferInsert;

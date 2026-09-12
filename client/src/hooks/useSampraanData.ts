@@ -70,7 +70,15 @@ export function useIdentities() {
     retry: false,
   });
   const query = isAuthenticated ? live : demo;
-  return toResult(query);
+  const result = toResult(query);
+  // Normalize the union: the protected procedure returns identities WITH
+  // roles; demo rows don't. The UI can rely on `roles` always being an array.
+  return {
+    ...result,
+    data: result.data as
+      | (import("@shared/types").Identity & { roles?: string[] })[]
+      | undefined,
+  };
 }
 
 /** Asset registry: protected assets.list, demo.assets fallback. */

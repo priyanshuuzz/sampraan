@@ -1,6 +1,7 @@
-import { and, desc, eq, inArray, isNotNull, isNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
+  assetApprovals,
   assetCustody,
   assets,
   auditEvents,
@@ -9,6 +10,7 @@ import {
   didRecords,
   identityRoles,
   permissions,
+  policies,
   rolePermissions,
   roles,
   securityAlerts,
@@ -108,12 +110,43 @@ export async function getUserByOpenId(openId: string) {
   return result.length > 0 ? result[0] : undefined;
 }
 
-// TODO: add feature queries here as your schema grows.
-
+/**
+ * LOCAL AUTH: resolve a platform user by email for the local login flow.
+ * Only meaningful for seed/admin-provisioned local accounts (passwordHash set);
+ * OAuth-sourced users have no password and never match a login attempt.
+ */
+export async function getUserByEmail(email: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(users).where(eq(users.email, email)).limit(1);
+  return rows[0];
+}
 
 export async function listIdentities() {
   const db = await getDb();
   return db ? db.select().from(identities).orderBy(desc(identities.createdAt)) : [];
+}
+
+/**
+ * Identity registry enriched with role names per identity (single query for
+ * the workspace surfaces that need to show roles without N+1 lookups).
+ */
+export async function getIdentitiesWithRoles(): Promise<(Identity & { roles: string[] })[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db.select().from(identities).orderBy(desc(identities.createdAt));
+  if (rows.length === 0) return [];
+  const roleRows = await db
+    .select({ identityId: identityRoles.identityId, roleName: roles.name })
+    .from(identityRoles)
+    .innerJoin(roles, eq(identityRoles.roleId, roles.id));
+  const byIdentity = new Map<string, string[]>();
+  for (const row of roleRows) {
+    const list = byIdentity.get(row.identityId) ?? [];
+    list.push(row.roleName);
+    byIdentity.set(row.identityId, list);
+  }
+  return rows.map(identity => ({ ...identity, roles: (byIdentity.get(identity.id) ?? []).sort() }));
 }
 
 export async function createIdentity(input: Omit<InsertIdentity, "id" | "createdAt" | "updatedAt">) {
@@ -146,6 +179,13 @@ export async function createAsset(input: Omit<InsertAsset, "id" | "createdAt" | 
   return rows[0];
 }
 
+/** Persist the on-chain NFT token id against the read-model asset row. */
+export async function setAssetTokenId(assetRowId: string, tokenId: string): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(assets).set({ tokenId }).where(eq(assets.id, assetRowId));
+}
+
 export async function getAssetById(id: string) {
   const db = await getDb();
   if (!db) return undefined;
@@ -154,7 +194,7 @@ export async function getAssetById(id: string) {
 }
 
 /**
- * Resolves the SAMPRAAN identity linked to a platform user (Manus auth user id).
+ * Resolves the SAMPRAAN identity linked to a platform user (platform auth user id).
  * Returns undefined when no identity is linked or the database is unavailable.
  */
 export async function getIdentityByLinkedUserId(linkedUserId: number) {
@@ -192,6 +232,135 @@ export async function getIdentityRolesAndPermissions(identityId: string): Promis
   };
 }
 
+/** RBAC catalog: every role with its permission keys (read-only inspection). */
+export async function listRolesWithPermissions(): Promise<{ id: string; name: string; description: string | null; permissions: string[] }[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const roleRows = await db.select().from(roles).orderBy(roles.name);
+  if (roleRows.length === 0) return [];
+  const mappingRows = await db
+    .select({ roleId: rolePermissions.roleId, key: permissions.key })
+    .from(rolePermissions)
+    .innerJoin(permissions, eq(rolePermissions.permissionId, permissions.id));
+  const byRole = new Map<string, string[]>();
+  for (const row of mappingRows) {
+    const list = byRole.get(row.roleId) ?? [];
+    list.push(row.key);
+    byRole.set(row.roleId, list);
+  }
+  return roleRows.map(role => ({
+    id: role.id,
+    name: role.name,
+    description: role.description ?? null,
+    permissions: (byRole.get(role.id) ?? []).sort(),
+  }));
+}
+
+/** All known permission keys (for the access-control matrix surface). */
+export async function listPermissions(): Promise<{ id: string; key: string; description: string | null }[]> {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select().from(permissions).orderBy(permissions.key);
+}
+
+/**
+ * RBAC write path (admin only at the API layer): replace an identity's role
+ * set. Rows are deleted and re-inserted in a transaction so the identity never
+ * ends up with zero-or-double roles mid-flight. Returns the updated role names.
+ */
+export async function applyIdentityRoles(input: {
+  identityId: string;
+  roleNames: string[];
+  assignedByIdentityId: string | null;
+}): Promise<string[] | null> {
+  const db = await getDb();
+  if (!db) return null;
+
+  const wanted = Array.from(new Set(input.roleNames.map(name => name.trim().toUpperCase()).filter(Boolean)));
+  const roleRows = wanted.length
+    ? await db.select().from(roles).where(inArray(roles.name, wanted))
+    : [];
+  const found = roleRows.map(row => row.name);
+  const missing = wanted.filter(name => !found.includes(name));
+  if (missing.length > 0) {
+    throw new Error(`Unknown role(s): ${missing.join(", ")}`);
+  }
+
+  await db.transaction(async tx => {
+    await tx.delete(identityRoles).where(eq(identityRoles.identityId, input.identityId));
+    if (roleRows.length > 0) {
+      await tx.insert(identityRoles).values(
+        roleRows.map(role => ({
+          identityId: input.identityId,
+          roleId: role.id,
+          assignedByIdentityId: input.assignedByIdentityId,
+        }))
+      );
+    }
+  });
+
+  return found;
+}
+
+/** Policy catalog (the access-control surfaces read this; the engine remains source of truth). */
+export async function listPolicies(): Promise<PolicyRow[]> {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select().from(policies).orderBy(desc(policies.active), policies.resourceType, policies.action);
+}
+
+/** Identity audit history: every audit row touching one identity (actor or target). */
+export async function listIdentityAuditEvents(identityId: string, limit = 100) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(auditEvents)
+    .where(
+      or(
+        eq(auditEvents.actorIdentityId, identityId),
+        and(eq(auditEvents.resourceType, "IDENTITY"), eq(auditEvents.resourceId, identityId)),
+      ),
+    )
+    .orderBy(desc(auditEvents.timestamp))
+    .limit(limit);
+}
+
+/** Asset provenance: custody rows for an asset, oldest first. */
+export async function listAssetCustody(assetRowId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(assetCustody)
+    .where(eq(assetCustody.assetId, assetRowId))
+    .orderBy(desc(assetCustody.startedAt));
+}
+
+/** Asset provenance: audit events whose resourceId matches the asset id. */
+export async function listAssetAuditEvents(assetId: string, limit = 100) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(auditEvents)
+    .where(and(eq(auditEvents.resourceType, "ASSET"), eq(auditEvents.resourceId, assetId)))
+    .orderBy(desc(auditEvents.timestamp))
+    .limit(limit);
+}
+
+/** Security intelligence: create an advisory alert from rule evaluation. */
+export async function createSecurityAlert(input: Omit<typeof securityAlerts.$inferInsert, "createdAt" | "resolvedAt">) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = input.id ?? crypto.randomUUID();
+  await db.insert(securityAlerts).values({ ...input, id } as typeof securityAlerts.$inferInsert);
+  const rows = await db.select().from(securityAlerts).where(eq(securityAlerts.id, id)).limit(1);
+  return rows[0];
+}
+
+export type PolicyRow = typeof policies.$inferSelect;
+
 export async function createAuthorizationDecision(input: typeof authorizationDecisions.$inferInsert) {
   const db = await getDb();
   if (!db) return undefined;
@@ -213,6 +382,27 @@ export async function createAuditEvent(input: typeof auditEvents.$inferInsert) {
 export async function listAuditEvents(limit = 50) {
   const db = await getDb();
   return db ? db.select().from(auditEvents).orderBy(desc(auditEvents.timestamp)).limit(limit) : [];
+}
+
+/**
+ * Alert lifecycle (investigator action): move an alert to INVESTIGATING or
+ * RESOLVED. Purely advisory workflow state — never part of authorization.
+ */
+export async function updateAlertStatus(input: {
+  alertId: string;
+  status: "OPEN" | "INVESTIGATING" | "RESOLVED";
+}): Promise<typeof securityAlerts.$inferSelect | null> {
+  const db = await getDb();
+  if (!db) return null;
+  await db
+    .update(securityAlerts)
+    .set({
+      status: input.status,
+      ...(input.status === "RESOLVED" ? { resolvedAt: new Date() } : {}),
+    })
+    .where(eq(securityAlerts.id, input.alertId));
+  const rows = await db.select().from(securityAlerts).where(eq(securityAlerts.id, input.alertId)).limit(1);
+  return rows[0] ?? null;
 }
 
 export async function listSecurityAlerts() {
@@ -358,6 +548,28 @@ export async function listIndexedChainTxHashes(): Promise<Set<string>> {
 }
 
 /**
+ * Durable PER-EVENT dedup keys for the chain indexer. One transaction can
+ * emit several distinct contract events (e.g. the ERC-721 Transfer next to
+ * AssetRegistered); deduping by tx hash alone would drop the siblings, so
+ * each projected row also stores its composite eventKey in metadata.
+ */
+export async function listIndexedChainEventKeys(): Promise<Set<string>> {
+  const db = await getDb();
+  if (!db) return new Set();
+  const rows = await db
+    .select({ metadata: auditEvents.metadata })
+    .from(auditEvents)
+    .where(eq(auditEvents.source, "CHAIN_READ_MODEL"))
+    .limit(5000);
+  const keys = new Set<string>();
+  for (const row of rows) {
+    const key = (row.metadata as { eventKey?: string } | null)?.eventKey;
+    if (typeof key === "string") keys.add(key);
+  }
+  return keys;
+}
+
+/**
  * QA #5 (server-side session revocation): given a session token, classify
  * its server-side tracking state. DISTINCT outcomes matter:
  *  - "UNTRACKED"  — no row exists for this token (e.g. cron sessions,
@@ -491,4 +703,94 @@ export async function trackPlatformSession(input: {
   } catch (error) {
     console.error("[Auth] Failed to track platform session:", error);
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Sensitive-asset approvals (LOOP 6)                                   */
+/* ------------------------------------------------------------------ */
+
+export async function createAssetApproval(input: {
+  assetId: string;
+  requesterIdentityId: string;
+  action: string;
+  targetIdentityId?: string | null;
+  reason?: string | null;
+}) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = crypto.randomUUID();
+  await db.insert(assetApprovals).values({
+    id,
+    assetId: input.assetId,
+    requesterIdentityId: input.requesterIdentityId,
+    action: input.action,
+    targetIdentityId: input.targetIdentityId ?? null,
+    status: "PENDING",
+    reason: input.reason ?? null,
+  });
+  const rows = await db.select().from(assetApprovals).where(eq(assetApprovals.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function getAssetApproval(approvalId: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(assetApprovals).where(eq(assetApprovals.id, approvalId)).limit(1);
+  return rows[0];
+}
+
+/** The active (non-terminal) approval for an asset+requester+action, if any. */
+export async function getActiveAssetApproval(input: { assetId: string; requesterIdentityId: string; action: string }) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db
+    .select()
+    .from(assetApprovals)
+    .where(
+      and(
+        eq(assetApprovals.assetId, input.assetId),
+        eq(assetApprovals.requesterIdentityId, input.requesterIdentityId),
+        eq(assetApprovals.action, input.action),
+        inArray(assetApprovals.status, ["PENDING", "APPROVED"]),
+      ),
+    )
+    .orderBy(desc(assetApprovals.createdAt))
+    .limit(1);
+  return rows[0];
+}
+
+export async function listAssetApprovals(assetId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(assetApprovals)
+    .where(eq(assetApprovals.assetId, assetId))
+    .orderBy(desc(assetApprovals.createdAt))
+    .limit(50);
+}
+
+export async function updateAssetApprovalStatus(input: {
+  approvalId: string;
+  status: "APPROVED" | "REJECTED";
+  approverIdentityId: string;
+}) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db
+    .update(assetApprovals)
+    .set({ status: input.status, approverIdentityId: input.approverIdentityId, decidedAt: new Date() })
+    .where(and(eq(assetApprovals.id, input.approvalId), eq(assetApprovals.status, "PENDING")));
+  if (!result || result[0].affectedRows === 0) return undefined;
+  return getAssetApproval(input.approvalId);
+}
+
+export async function markAssetApprovalExecuted(approvalId: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  await db
+    .update(assetApprovals)
+    .set({ status: "EXECUTED", executedAt: new Date() })
+    .where(eq(assetApprovals.id, approvalId));
+  return getAssetApproval(approvalId);
 }

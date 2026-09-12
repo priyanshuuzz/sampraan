@@ -25,7 +25,7 @@ with sync_playwright() as p:
     ctx = browser.new_context()
     page = ctx.new_page()
     page.add_init_script(
-        f"sessionStorage.setItem('manus-cookie', {json.dumps('app_session_id=' + token)});"
+        f"sessionStorage.setItem('sampraan-session', {json.dumps('app_session_id=' + token)});"
     )
     errors = []
     page.on("pageerror", lambda e: errors.append(str(e)))

@@ -25,6 +25,13 @@ const dbMocks = vi.hoisted(() => ({
   createDidRecord: vi.fn(),
   applyCustodyTransfer: vi.fn(),
   applyIdentityStatusChange: vi.fn(),
+  getDb: vi.fn(async () => null),
+  getActiveAssetApproval: vi.fn(),
+  createAssetApproval: vi.fn(),
+  getAssetApproval: vi.fn(),
+  listAssetApprovals: vi.fn(),
+  updateAssetApprovalStatus: vi.fn(),
+  markAssetApprovalExecuted: vi.fn(),
   applyAssetStatusChange: vi.fn(),
 }));
 
@@ -126,6 +133,16 @@ beforeEach(() => {
   dbMocks.applyCustodyTransfer.mockResolvedValue({ id: "asset-1", updated: true });
   dbMocks.applyIdentityStatusChange.mockResolvedValue({ id: "identity-1", status: "ACTIVE" });
   dbMocks.applyAssetStatusChange.mockResolvedValue({ id: "asset-1", status: "ACTIVE" });
+  // assets.create validates owner/custodian identities before writing; both
+  // must resolve to ACTIVE identity records (identity-1 = owner, identity-2 =
+  // custodian per the fixture UUIDs).
+  dbMocks.getIdentityById.mockImplementation(async (identityId: string) =>
+    identityId === "00000000-0000-4000-8000-000000000001"
+      ? { id: identityId, displayName: "Owner", status: "ACTIVE" }
+      : identityId === "00000000-0000-4000-8000-000000000002"
+        ? { id: identityId, displayName: "Custodian", status: "ACTIVE" }
+        : { id: identityId, status: "ACTIVE" },
+  );
 });
 
 describe("BUG-003: creation anchors on-chain", () => {

@@ -7,6 +7,7 @@ import type { TrpcContext } from "./_core/context";
 
 const dbMocks = vi.hoisted(() => ({
   listIdentities: vi.fn(),
+  getIdentitiesWithRoles: vi.fn(),
   createIdentity: vi.fn(),
   listAssets: vi.fn(),
   createAsset: vi.fn(),
@@ -21,6 +22,13 @@ const dbMocks = vi.hoisted(() => ({
   createDidRecord: vi.fn(),
   applyCustodyTransfer: vi.fn(),
   applyIdentityStatusChange: vi.fn(),
+  getDb: vi.fn(async () => null),
+  getActiveAssetApproval: vi.fn(),
+  createAssetApproval: vi.fn(),
+  getAssetApproval: vi.fn(),
+  listAssetApprovals: vi.fn(),
+  updateAssetApprovalStatus: vi.fn(),
+  markAssetApprovalExecuted: vi.fn(),
 }));
 
 const blockchainMocks = vi.hoisted(() => ({
@@ -116,7 +124,7 @@ function userFixture(overrides: Partial<TestUser> = {}): TestUser {
     openId: "sample-user",
     email: "sample@example.com",
     name: "Sample User",
-    loginMethod: "manus",
+    loginMethod: "local",
     role: "user",
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -183,11 +191,12 @@ describe("protected procedures require authentication", () => {
   });
 
   it("allows authenticated users to list identities", async () => {
-    const identities = [{ id: "identity-1", displayName: "Aarav Mehta" }];
-    dbMocks.listIdentities.mockResolvedValue(identities);
+    // identities.list serves the enriched registry (identity + role names).
+    const identities = [{ id: "identity-1", displayName: "Aarav Mehta", roles: ["USER"] }];
+    dbMocks.getIdentitiesWithRoles.mockResolvedValue(identities);
     const caller = await callerFor(context(userFixture()));
     await expect(caller.identities.list()).resolves.toEqual(identities);
-    expect(dbMocks.listIdentities).toHaveBeenCalledTimes(1);
+    expect(dbMocks.getIdentitiesWithRoles).toHaveBeenCalledTimes(1);
   });
 
   it("allows authenticated users to list assets", async () => {

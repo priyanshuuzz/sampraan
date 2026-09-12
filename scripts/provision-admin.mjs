@@ -1,7 +1,7 @@
 /**
  * DEMO/LOCAL integration helper: provision a platform admin user, link it to
  * a SAMPRAAN identity, and print a valid session token so live API flows can
- * be exercised without the (unavailable) Manus OAuth server.
+ * be exercised without an external OAuth provider.
  *
  * This script is for LOCAL DEMO ONLY — it prints a bearer token to stdout.
  * It is not imported by the application and never runs in production paths.

@@ -35,7 +35,6 @@ logs
 *.log
 
 # Browser debug logs written by the local dev collector
-.manus-logs/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -112,8 +111,6 @@ temp/
 # Webdev artifacts (checkpoint zips, migrations, etc.)
 .webdev/
 
-# Manus version file (auto-generated, not part of source)
-client/public/__manus__/version.json
 .project-config.json
 # SAMPRAAN blockchain runtime data (chain state must never be committed)
 blockchain/network/nodedata/
@@ -132,3 +129,7 @@ blockchain/*.local.env
 # (keys are dev-only tutorial material for the local QBFT chain, but node
 #  signing keys must never live in version control)
 blockchain/network/generated/keys/
+
+# Local agent/IDE runtime artifacts (not part of the app)
+.freebuff/
+blockchain/network/generated.old/

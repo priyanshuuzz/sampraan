@@ -2,12 +2,12 @@
   "network": "SAMPRAAN-LOCAL-QBFT",
   "chainId": 4224,
   "rpcUrl": "http://localhost:8545",
-  "deployedAt": "2026-09-04T17:56:18.454Z",
+  "deployedAt": "2026-09-09T00:59:24.826Z",
   "deployerAddress": "0xFE3B557E8Fb62b89F4916B721be55cEb828dBd73",
   "auditorAddress": "0x627306090abaB3A6e1400e9345bC60c78a8BEf57",
   "contracts": {
-    "SampraanAccessControl": "0xa0E49611FB410c00f425E83A4240e1681c51DDf4",
-    "SampraanIdentityRegistry": "0x9c4a86f42290295F5E9cf01ae980750f0A72528b",
-    "SampraanAssetRegistry": "0xD26D74781a0Aafca860CB58614C9df02B8b7a5a5"
+    "SampraanAccessControl": "0x42699A7612A82f1d9C36148af9C77354759b210b",
+    "SampraanIdentityRegistry": "0xa50a51c09a5c451C52BB714527E1974b686D8e77",
+    "SampraanAssetRegistry": "0x9a3DBCa554e9f6b9257aAa24010DA8377C57c17e"
   }
 }
