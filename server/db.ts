@@ -548,6 +548,28 @@ export async function listIndexedChainTxHashes(): Promise<Set<string>> {
 }
 
 /**
+ * Durable PER-EVENT dedup keys for the chain indexer. One transaction can
+ * emit several distinct contract events (e.g. the ERC-721 Transfer next to
+ * AssetRegistered); deduping by tx hash alone would drop the siblings, so
+ * each projected row also stores its composite eventKey in metadata.
+ */
+export async function listIndexedChainEventKeys(): Promise<Set<string>> {
+  const db = await getDb();
+  if (!db) return new Set();
+  const rows = await db
+    .select({ metadata: auditEvents.metadata })
+    .from(auditEvents)
+    .where(eq(auditEvents.source, "CHAIN_READ_MODEL"))
+    .limit(5000);
+  const keys = new Set<string>();
+  for (const row of rows) {
+    const key = (row.metadata as { eventKey?: string } | null)?.eventKey;
+    if (typeof key === "string") keys.add(key);
+  }
+  return keys;
+}
+
+/**
  * QA #5 (server-side session revocation): given a session token, classify
  * its server-side tracking state. DISTINCT outcomes matter:
  *  - "UNTRACKED"  — no row exists for this token (e.g. cron sessions,
