@@ -1,0 +1,52 @@
+"""
+SAMPRAAN subgraph schema (LOOP 11).
+
+Query-only blockchain indexing. These entities are projections of REAL
+contract events; nothing here participates in authorization.
+"""
+type Asset @entity {
+  id: ID!                      # tokenId as string
+  assetIdDigest: Bytes!        # keccak256 of the off-chain asset identifier
+  classificationDigest: Bytes!
+  status: Int!                 # 0 NONE 1 PENDING 2 ACTIVE 3 SUSPENDED 4 REVOKED
+  custodian: Bytes!            # current custodian wallet
+  creator: Bytes               # initial custodian from AssetRegistered
+  mintTransactionHash: Bytes
+  mintBlockNumber: Int
+  mintedAt: BigInt
+  registeredAt: BigInt!
+  updatedAt: BigInt!
+  transfers: [AssetTransfer!]! @derivedFrom(field: "asset")
+}
+
+type AssetTransfer @entity {
+  id: ID!                      # txHash-logIndex
+  asset: Asset!
+  kind: String!                # MINT | ASSIGNMENT | TRANSFER
+  fromCustodian: Bytes
+  toCustodian: Bytes!
+  operator: Bytes!
+  transactionHash: Bytes!
+  blockNumber: Int!
+  blockTimestamp: BigInt!
+}
+
+type Identity @entity {
+  id: ID!                      # reference wallet address
+  wallet: Bytes!
+  didDigest: Bytes!
+  status: Int!                 # 0 NONE 1 ACTIVE 2 SUSPENDED 3 REVOKED
+  registeredAt: BigInt!
+  lastChangedAt: BigInt!
+  lastTransactionHash: Bytes
+}
+
+type BlockchainEvent @entity {
+  id: ID!                      # txHash-logIndex
+  contract: String!            # SampraanAssetRegistry | SampraanIdentityRegistry | SampraanAccessControl
+  eventName: String!           # AssetRegistered | AssetTransferred | IdentityRegistered | ...
+  blockNumber: Int!
+  blockTimestamp: BigInt!
+  transactionHash: Bytes!
+  payload: String              # JSON-encoded indexed args (query convenience)
+}

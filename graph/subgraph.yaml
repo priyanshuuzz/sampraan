@@ -1,0 +1,80 @@
+specVersion: 1.0.0
+indexerVersion: v0.0.1
+description: SAMPRAAN identity, asset, and role event indexing (LOOP 11)
+repository: https://github.com/bel-sih-2026/sampraan
+schema:
+  file: ./schema.graphql
+dataSources:
+  - kind: ethereum
+    name: SampraanAssetRegistry
+    network: besu
+    source:
+      address: "0x9a3DBCa554e9f6b9257aAa24010DA8377C57c17e"
+      abi: SampraanAssetRegistry
+      startBlock: 0
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.9
+      language: wasm/assemblyscript
+      entities:
+        - Asset
+        - AssetTransfer
+        - BlockchainEvent
+      abis:
+        - name: SampraanAssetRegistry
+          file: ../blockchain/artifacts/SampraanAssetRegistry.json
+      eventHandlers:
+        - event: AssetRegistered(indexed uint256,indexed bytes32,indexed address,bytes32,bytes32,uint64)
+          handler: handleAssetRegistered
+        - event: AssetAssigned(indexed uint256,indexed bytes32,indexed address,address,uint64)
+          handler: handleAssetAssigned
+        - event: AssetTransferred(indexed uint256,indexed bytes32,indexed address,address,address,uint64)
+          handler: handleAssetTransferred
+        - event: AssetStatusChanged(indexed uint256,indexed bytes32,uint8,uint8,address,uint64)
+          handler: handleAssetStatusChanged
+      file: ./mappings/asset-registry.ts
+  - kind: ethereum
+    name: SampraanIdentityRegistry
+    network: besu
+    source:
+      address: "0xa50a51c09a5c451C52BB714527E1974b686D8e77"
+      abi: SampraanIdentityRegistry
+      startBlock: 0
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.9
+      language: wasm/assemblyscript
+      entities:
+        - Identity
+        - BlockchainEvent
+      abis:
+        - name: SampraanIdentityRegistry
+          file: ../blockchain/artifacts/SampraanIdentityRegistry.json
+      eventHandlers:
+        - event: IdentityRegistered(indexed address,indexed bytes32,bytes32,uint64)
+          handler: handleIdentityRegistered
+        - event: IdentityStatusChanged(indexed address,indexed bytes32,uint8,uint8,uint64)
+          handler: handleIdentityStatusChanged
+      file: ./mappings/identity-registry.ts
+  - kind: ethereum
+    name: SampraanAccessControl
+    network: besu
+    source:
+      address: "0x42699A7612A82f1d9C36148af9C77354759b210b"
+      abi: SampraanAccessControl
+      startBlock: 0
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.9
+      language: wasm/assemblyscript
+      entities:
+        - BlockchainEvent
+      abis:
+        - name: SampraanAccessControl
+          file: ../blockchain/artifacts/SampraanAccessControl.json
+      eventHandlers:
+        - event: RoleGranted(indexed bytes32,indexed address,indexed address)
+          handler: handleRoleGranted
+        - event: RoleRevoked(indexed bytes32,indexed address,indexed address)
+          handler: handleRoleRevoked
+      file: ./mappings/access-control.ts

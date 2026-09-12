@@ -313,15 +313,37 @@ describe("assets.authorizeTransfer — actor-linked-identity model", () => {
       permissions: ["asset:transfer"],
     });
     // A CONTROLLED asset so the HIGHLY_SENSITIVE USER guard does not apply.
+    // LOOP 4 custody policy: the actor must be the CURRENT custodian, so the
+    // fixture puts the asset in the acting MANAGER's custody.
     mockedGetAssetById.mockResolvedValue({
       ...activeAsset,
       classification: "CONTROLLED",
+      custodianIdentityId: activeIdentity.id,
     });
     const caller = appRouter.createCaller(makeContext(makeUser()));
     const result = await caller.assets.authorizeTransfer(transferInput);
 
     expect(result.decision).toBe("ALLOW");
     expect(result.transaction).toMatchObject({ status: "CONFIRMED" });
+  });
+
+  it("DENIES a MANAGER with permission who is NOT the current custodian (POLICY-CUSTODY)", async () => {
+    mockedGetIdentityByLinkedUserId.mockResolvedValue(activeIdentity);
+    mockedGetRolesAndPermissions.mockResolvedValue({
+      roles: ["MANAGER"],
+      permissions: ["asset:transfer"],
+    });
+    mockedGetAssetById.mockResolvedValue({
+      ...activeAsset,
+      classification: "CONTROLLED",
+      custodianIdentityId: "0e0d3b1a-aaaa-4bbb-8ccc-444455558888",
+    });
+    const caller = appRouter.createCaller(makeContext(makeUser()));
+    const result = await caller.assets.authorizeTransfer(transferInput);
+
+    expect(result.decision).toBe("DENY");
+    expect(result.policyId).toBe("POLICY-CUSTODY");
+    expect(result.transaction).toBeNull();
   });
 
   it("DENIES a MANAGER without asset:transfer even on a controlled asset", async () => {

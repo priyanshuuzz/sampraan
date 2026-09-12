@@ -1,6 +1,7 @@
 import { and, desc, eq, inArray, isNotNull, isNull, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
+  assetApprovals,
   assetCustody,
   assets,
   auditEvents,
@@ -680,4 +681,94 @@ export async function trackPlatformSession(input: {
   } catch (error) {
     console.error("[Auth] Failed to track platform session:", error);
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Sensitive-asset approvals (LOOP 6)                                   */
+/* ------------------------------------------------------------------ */
+
+export async function createAssetApproval(input: {
+  assetId: string;
+  requesterIdentityId: string;
+  action: string;
+  targetIdentityId?: string | null;
+  reason?: string | null;
+}) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = crypto.randomUUID();
+  await db.insert(assetApprovals).values({
+    id,
+    assetId: input.assetId,
+    requesterIdentityId: input.requesterIdentityId,
+    action: input.action,
+    targetIdentityId: input.targetIdentityId ?? null,
+    status: "PENDING",
+    reason: input.reason ?? null,
+  });
+  const rows = await db.select().from(assetApprovals).where(eq(assetApprovals.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function getAssetApproval(approvalId: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(assetApprovals).where(eq(assetApprovals.id, approvalId)).limit(1);
+  return rows[0];
+}
+
+/** The active (non-terminal) approval for an asset+requester+action, if any. */
+export async function getActiveAssetApproval(input: { assetId: string; requesterIdentityId: string; action: string }) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db
+    .select()
+    .from(assetApprovals)
+    .where(
+      and(
+        eq(assetApprovals.assetId, input.assetId),
+        eq(assetApprovals.requesterIdentityId, input.requesterIdentityId),
+        eq(assetApprovals.action, input.action),
+        inArray(assetApprovals.status, ["PENDING", "APPROVED"]),
+      ),
+    )
+    .orderBy(desc(assetApprovals.createdAt))
+    .limit(1);
+  return rows[0];
+}
+
+export async function listAssetApprovals(assetId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(assetApprovals)
+    .where(eq(assetApprovals.assetId, assetId))
+    .orderBy(desc(assetApprovals.createdAt))
+    .limit(50);
+}
+
+export async function updateAssetApprovalStatus(input: {
+  approvalId: string;
+  status: "APPROVED" | "REJECTED";
+  approverIdentityId: string;
+}) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db
+    .update(assetApprovals)
+    .set({ status: input.status, approverIdentityId: input.approverIdentityId, decidedAt: new Date() })
+    .where(and(eq(assetApprovals.id, input.approvalId), eq(assetApprovals.status, "PENDING")));
+  if (!result || result[0].affectedRows === 0) return undefined;
+  return getAssetApproval(input.approvalId);
+}
+
+export async function markAssetApprovalExecuted(approvalId: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  await db
+    .update(assetApprovals)
+    .set({ status: "EXECUTED", executedAt: new Date() })
+    .where(eq(assetApprovals.id, approvalId));
+  return getAssetApproval(approvalId);
 }

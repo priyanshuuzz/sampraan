@@ -9,6 +9,12 @@ import { authorizationService } from "./modules/authorization/authorization.serv
 import { blockchainService, besuBlockchainService } from "./modules/blockchain/blockchain.service";
 import type { BesuBlockchainService as BesuService } from "./modules/blockchain/besu-blockchain.service";
 import {
+  createAssetApproval,
+  getActiveAssetApproval,
+  getAssetApproval,
+  listAssetApprovals,
+  markAssetApprovalExecuted,
+  updateAssetApprovalStatus,
   applyAssetStatusChange,
   applyCustodyTransfer,
   applyIdentityRoles,
@@ -38,6 +44,18 @@ import {
   updateAlertStatus,
 } from "./db";
 import { anchoringService, deriveIdentityWallet } from "./modules/blockchain/anchoring.service";
+import {
+  createDidChallenge,
+  verifyDidChallenge,
+  rotateDidKey,
+  setDidKeyStatus,
+  createStepUpChallenge,
+  verifyStepUpChallenge,
+  hasValidStepUp,
+  fingerprintNonce,
+} from "./modules/did/did-auth.service";
+import { buildAssetProvenance } from "./modules/provenance/provenance.service";
+import { graphQueryService } from "./modules/graph/graph.service";
 import { isDuplicateEntryError } from "./modules/db/db-errors";
 import { describeError } from "./common/error-handler";
 import { verifyPassword } from "./auth/password";
@@ -72,6 +90,124 @@ const did = z
 
 export const appRouter = router({
   system: systemRouter,
+  /**
+   * DID authentication (LOOP 2) + key lifecycle (LOOP 3).
+   * Challenge-response: server issues a single-use expiring nonce bound to
+   * the DID; the caller signs it with the DID key; the server verifies the
+   * signature recovers to the DID's on-chain reference wallet. Revoked or
+   * rotated keys fail closed BEFORE any signature work.
+   */
+  did: router({
+    requestChallenge: publicProcedure
+      .input(z.object({ did: z.string().min(8).max(255) }))
+      .mutation(async ({ input }) => {
+        const result = await createDidChallenge(input.did.trim());
+        if (!result.ok) {
+          await createAuditEvent({ actorIdentityId: null, action: "DID_CHALLENGE_REQUESTED", resourceType: "IDENTITY", resourceId: input.did, decision: "DENY", reason: result.reason, metadata: { source: "did-auth", code: result.code } }).catch(() => undefined);
+          throw new TRPCError({ code: result.code === "DID_NOT_FOUND" ? "NOT_FOUND" : "FORBIDDEN", message: result.reason });
+        }
+        await createAuditEvent({ actorIdentityId: null, action: "DID_CHALLENGE_REQUESTED", resourceType: "IDENTITY", resourceId: input.did, decision: "ALLOW", reason: "Challenge issued", metadata: { source: "did-auth", nonceFingerprint: fingerprintNonce(result.challenge.nonce), expiresAt: result.challenge.expiresAt } }).catch(() => undefined);
+        return result.challenge;
+      }),
+    verifyChallenge: publicProcedure
+      .input(z.object({ did: z.string().min(8).max(255), nonce: z.string().min(16).max(128), signature: z.string().min(32).max(255) }))
+      .mutation(async ({ input }) => {
+        const operatorKey = besuBlockchainService?.config.privateKey ?? null;
+        if (!operatorKey) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Blockchain operator key is not configured — DID verification unavailable" });
+        const result = await verifyDidChallenge({ did: input.did.trim(), nonce: input.nonce, signature: input.signature, operatorKey });
+        if (!result.ok) {
+          await createAuditEvent({ actorIdentityId: null, action: "DID_AUTH_FAILED", resourceType: "IDENTITY", resourceId: input.did, decision: "DENY", reason: result.reason, metadata: { source: "did-auth", code: result.code } }).catch(() => undefined);
+          scheduleIntelligenceScan();
+          throw new TRPCError({ code: "UNAUTHORIZED", message: result.reason });
+        }
+        // DID authentication mints the SAME server-tracked session the
+        // password path uses; roles still come from the database per request.
+        let sessionToken: string | null = null;
+        if (result.linkedUserId) {
+          const db = await import("./db").then(m => m.getDb());
+          const linkedUser = await (async () => {
+            if (!db) return null;
+            const { users } = await import("../drizzle/schema");
+            const { eq } = await import("drizzle-orm");
+            const rows = await db.select().from(users).where(eq(users.id, result.linkedUserId!)).limit(1);
+            return rows[0] ?? null;
+          })();
+          if (linkedUser) {
+            sessionToken = await sdk.createSessionToken(linkedUser.openId, { name: linkedUser.name ?? "", expiresInMs: SESSION_TTL_MS });
+            const { trackPlatformSession } = await import("./db");
+            await trackPlatformSession({ sessionToken, linkedUserId: linkedUser.id, expiresAt: new Date(Date.now() + SESSION_TTL_MS) });
+          }
+        }
+        const identity = await getIdentityById(result.identityId);
+        await createAuditEvent({ actorIdentityId: result.identityId, action: "DID_AUTH_SUCCEEDED", resourceType: "IDENTITY", resourceId: result.did, decision: "ALLOW", reason: "Challenge signature verified against the DID reference wallet", metadata: { source: "did-auth", recoveredAddress: result.recoveredAddress, sessionIssued: Boolean(sessionToken) } }).catch(() => undefined);
+        return { ok: true as const, identityId: result.identityId, did: result.did, displayName: identity?.displayName ?? null, identityStatus: identity?.status ?? null, sessionToken };
+      }),
+    /** Key lifecycle read model. */
+    keyStatus: protectedProcedure.input(z.object({ did: z.string().min(8).max(255) })).query(async ({ input }) => {
+      const db = await import("./db").then(m => m.getDb());
+      if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
+      const { didRecords } = await import("../drizzle/schema");
+      const { eq } = await import("drizzle-orm");
+      const rows = await db.select({ status: didRecords.status, keyStatus: didRecords.keyStatus, rotatedAt: didRecords.rotatedAt, revokedAt: didRecords.revokedAt }).from(didRecords).where(eq(didRecords.did, input.did)).limit(1);
+      if (!rows[0]) throw new TRPCError({ code: "NOT_FOUND", message: "DID not found" });
+      return rows[0];
+    }),
+    /** Rotate the current key: the old key immediately stops authenticating. */
+    rotateKey: protectedProcedure.input(z.object({ did: z.string().min(8).max(255) })).mutation(async ({ input, ctx }) => {
+      const result = await rotateDidKey(input.did);
+      if (!result.ok) throw new TRPCError({ code: "BAD_REQUEST", message: result.reason });
+      const actor = await getIdentityByLinkedUserId(ctx.user.id);
+      await createAuditEvent({ actorIdentityId: actor?.id ?? null, action: "DID_KEY_ROTATED", resourceType: "IDENTITY", resourceId: input.did, decision: "ALLOW", reason: "Key marked ROTATED — previous key cannot authenticate", metadata: { source: "did-lifecycle" } }).catch(() => undefined);
+      return result;
+    }),
+    /** Explicit key activation or revocation (admin only). */
+    setKeyStatus: adminProcedure.input(z.object({ did: z.string().min(8).max(255), keyStatus: z.enum(["ACTIVE", "REVOKED"]) })).mutation(async ({ input, ctx }) => {
+      const result = await setDidKeyStatus(input.did, input.keyStatus);
+      if (!result.ok) throw new TRPCError({ code: "BAD_REQUEST", message: result.reason });
+      const actor = await getIdentityByLinkedUserId(ctx.user.id);
+      await createAuditEvent({ actorIdentityId: actor?.id ?? null, action: input.keyStatus === "REVOKED" ? "DID_KEY_REVOKED" : "DID_KEY_ACTIVATED", resourceType: "IDENTITY", resourceId: input.did, decision: "ALLOW", reason: `Key status set to ${input.keyStatus}`, metadata: { source: "did-lifecycle" } }).catch(() => undefined);
+      return result;
+    }),
+  }),
+  /**
+   * Server-verified step-up authentication (LOOP 5). A CHALLENGE policy
+   * decision for a HIGHLY_SENSITIVE transfer is only satisfied by consuming
+   * a signature-verified step-up bound to (identity, purpose).
+   */
+  stepup: router({
+    requestChallenge: protectedProcedure
+      .input(z.object({ assetId: z.string().uuid() }))
+      .mutation(async ({ ctx, input }) => {
+        const actorIdentity = await getIdentityByLinkedUserId(ctx.user.id);
+        if (!actorIdentity) throw new TRPCError({ code: "FORBIDDEN", message: "No SAMPRAAN identity is linked to this session" });
+        const asset = await getAssetById(input.assetId);
+        if (!asset) throw new TRPCError({ code: "NOT_FOUND", message: "Asset not found" });
+        const purpose = `transfer:${asset.assetId}`;
+        const challenge = await createStepUpChallenge(actorIdentity.id, purpose);
+        if (!("nonce" in challenge)) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: challenge.reason });
+        await createAuditEvent({ actorIdentityId: actorIdentity.id, action: "STEP_UP_CHALLENGE_ISSUED", resourceType: "ASSET", resourceId: asset.assetId, decision: "CHALLENGE", reason: `Step-up challenge issued for ${purpose}`, metadata: { source: "step-up", nonceFingerprint: fingerprintNonce(challenge.nonce) } }).catch(() => undefined);
+        return challenge;
+      }),
+    verify: protectedProcedure
+      .input(z.object({ assetId: z.string().uuid(), nonce: z.string().min(16).max(128), signature: z.string().min(32).max(255) }))
+      .mutation(async ({ ctx, input }) => {
+        const operatorKey = besuBlockchainService?.config.privateKey ?? null;
+        if (!operatorKey) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Blockchain operator key is not configured" });
+        const actorIdentity = await getIdentityByLinkedUserId(ctx.user.id);
+        if (!actorIdentity) throw new TRPCError({ code: "FORBIDDEN", message: "No SAMPRAAN identity is linked to this session" });
+        const asset = await getAssetById(input.assetId);
+        if (!asset) throw new TRPCError({ code: "NOT_FOUND", message: "Asset not found" });
+        const purpose = `transfer:${asset.assetId}`;
+        const result = await verifyStepUpChallenge({ identityId: actorIdentity.id, purpose, nonce: input.nonce, signature: input.signature, operatorKey });
+        if (!result.ok) {
+          await createAuditEvent({ actorIdentityId: actorIdentity.id, action: "STEP_UP_FAILED", resourceType: "ASSET", resourceId: asset.assetId, decision: "DENY", reason: result.reason, metadata: { source: "step-up", code: result.code } }).catch(() => undefined);
+          scheduleIntelligenceScan();
+          throw new TRPCError({ code: "UNAUTHORIZED", message: result.reason });
+        }
+        await createAuditEvent({ actorIdentityId: actorIdentity.id, action: "STEP_UP_SUCCEEDED", resourceType: "ASSET", resourceId: asset.assetId, decision: "ALLOW", reason: "Step-up signature verified server-side", metadata: { source: "step-up", purpose } }).catch(() => undefined);
+        return { ok: true as const, purpose, validForMs: 10 * 60 * 1000 };
+      }),
+  }),
   health: publicProcedure.query(async () => ({ api: "OK" as const, database: process.env.DATABASE_URL ? "CONFIGURED" as const : "NOT_CONFIGURED" as const, blockchain: await blockchainService.getNetworkStatus() })),
   observatory: publicProcedure.query(async () => { const [identities, assets, audit, alerts, blockchain] = await Promise.all([listIdentities(), listAssets(), listAuditEvents(200), listSecurityAlerts(), blockchainService.getNetworkStatus()]); return { identityCount: identities.length, assetCount: assets.length, auditEventCount: audit.length, openAlertCount: alerts.filter(alert => alert.status === "OPEN").length, blockchain }; }),
   demo: router({
@@ -697,21 +833,40 @@ export const appRouter = router({
         // attribution (never the resource owner) before returning.
         await createAuditEvent({ actorIdentityId: actorIdentity?.id ?? null, action: "AUTHORIZATION_DENIED", resourceType: "ASSET", resourceId: asset.assetId, decision: "DENY", reason, metadata: { source: "authorization-engine", policyId: null, actorOpenId: ctx.user.openId, actorUserRole: ctx.user.role, actorUserOpenId: ctx.user.openId, ownerStatus } });
         return { ...decision, transaction: null };
-      }
-
+      }      // ABAC CONTEXT (server-resolved only, LOOP 4/5/6):
+      //  - custody: current custodian identity from the DATABASE read model
+      //  - step-up: a server-verified step-up session for this exact asset
+      //  - approval: the requester's active approval row for this operation
+      //  - risk: advisory level from the security-intelligence rule engine
+      // The client can influence NONE of these values.
+      const role = ctx.user.role === "admin" ? "ADMIN" : roles[0] ?? "USER";
+      const purpose = `transfer:${asset.assetId}`;
+      const [stepUpValid, approvalRow, riskLevel] = await Promise.all([
+        actorIdentity ? hasValidStepUp(actorIdentity.id, purpose) : Promise.resolve(false),
+        actorIdentity ? getActiveAssetApproval({ assetId: asset.id, requesterIdentityId: actorIdentity.id, action: "TRANSFER" }) : Promise.resolve(undefined),
+        securityIntelligenceService.assessRisk({ identityId: actorIdentity?.id ?? null, action: "TRANSFER", classification: asset.classification }),
+      ]);
+      const sensitive = asset.classification === "HIGHLY_SENSITIVE" || asset.classification === "CRITICAL";
       const result = authorizationService.evaluate({
         identityStatus: actorIdentity?.status ?? "UNREGISTERED",
         // Platform admin maps to the ADMIN role and gains administration:manage;
         // both are still subject to the engine's identity-status check above.
-        role: ctx.user.role === "admin" ? "ADMIN" : roles[0] ?? "USER",
+        role,
         permissions: ctx.user.role === "admin" ? Array.from(new Set([...permissions, "administration:manage"])) : permissions,
         resourceType: "asset",
         action: "TRANSFER",
         // SECURITY: classification always comes from the database record,
-        // never from a client-supplied value. No client step-up state is
-        // forwarded: there is no server-side step-up mechanism, so
-        // HIGHLY_SENSITIVE transfers CHALLENGE instead of silently ALLOWing.
+        // never from a client-supplied value. Step-up state comes from the
+        // server-verified step-up session store only.
         assetClassification: asset.classification,
+        actorIdentityId: actorIdentity?.id,
+        currentCustodianIdentityId: asset.custodianIdentityId,
+        approvalStatus: approvalRow?.status,
+        riskLevel,
+        context: {
+          stepUpAuthenticated: stepUpValid,
+          approvalRequired: sensitive,
+        },
       });
 
       // SECURITY: audit and decision records always attribute the ACTOR —
@@ -903,6 +1058,12 @@ export const appRouter = router({
       // history to the RECIPIENT identity (the acting identity when no
       // recipient was named). If the DB write fails, record the drift
       // explicitly — never silently leave the two layers disagreeing.
+      // LOOP 6: a consumed approval is marked EXECUTED so the same approval
+      // can never authorize a second transfer (execution revalidated policy
+      // above before the chain call).
+      if (approvalRow && approvalRow.status === "APPROVED") {
+        await markAssetApprovalExecuted(approvalRow.id).catch(() => undefined);
+      }
       const custodianUpdate = await applyCustodyTransfer({
         assetRowId: asset.id,
         newCustodianIdentityId: recipient?.id ?? null,
@@ -1070,6 +1231,129 @@ export const appRouter = router({
         throw new TRPCError({ code: "BAD_GATEWAY", message: `Blockchain event query failed: ${reason}` });
       }
     }),
+  }),
+  /**
+   * Sensitive-asset approval workflow (LOOP 6). Approvals gate sensitive
+   * TRANSFER operations at the application layer; the smart contract still
+   * independently re-verifies every state transition.
+   */
+  approvals: router({
+    list: protectedProcedure.input(z.object({ assetId: z.string().uuid() })).query(({ input }) => listAssetApprovals(input.assetId)),
+    /** Request approval for a sensitive transfer (requester = current session identity). */
+    request: protectedProcedure
+      .input(z.object({ assetId: z.string().uuid(), action: z.literal("TRANSFER").default("TRANSFER"), targetIdentityId: z.string().uuid().optional(), reason: z.string().max(300).optional() }))
+      .mutation(async ({ ctx, input }) => {
+        const actorIdentity = await getIdentityByLinkedUserId(ctx.user.id);
+        if (!actorIdentity) throw new TRPCError({ code: "FORBIDDEN", message: "No SAMPRAAN identity is linked to this session" });
+        const asset = await getAssetById(input.assetId);
+        if (!asset) throw new TRPCError({ code: "NOT_FOUND", message: "Asset not found" });
+        const existing = await getActiveAssetApproval({ assetId: asset.id, requesterIdentityId: actorIdentity.id, action: input.action });
+        if (existing) return existing;
+        const approval = await createAssetApproval({
+          assetId: asset.id,
+          requesterIdentityId: actorIdentity.id,
+          action: input.action,
+          targetIdentityId: input.targetIdentityId ?? null,
+          reason: input.reason ?? null,
+        });
+        if (!approval) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Approval could not be persisted" });
+        await createAuditEvent({ actorIdentityId: actorIdentity.id, action: "APPROVAL_REQUESTED", resourceType: "ASSET", resourceId: asset.assetId, decision: "CHALLENGE", reason: `Approval requested for ${input.action} of ${asset.classification} asset`, metadata: { source: "approval-workflow", approvalId: approval.id } }).catch(() => undefined);
+        return approval;
+      }),
+    /** Approve/reject — ADMIN (or approval-holder role per policy) only. */
+    decide: protectedProcedure
+      .input(z.object({ approvalId: z.string().uuid(), decision: z.enum(["APPROVED", "REJECTED"]), reason: z.string().max(300).optional() }))
+      .mutation(async ({ ctx, input }) => {
+        const actorIdentity = await getIdentityByLinkedUserId(ctx.user.id);
+        if (!actorIdentity) throw new TRPCError({ code: "FORBIDDEN", message: "No SAMPRAAN identity is linked to this session" });
+        const approval = await getAssetApproval(input.approvalId);
+        if (!approval) throw new TRPCError({ code: "NOT_FOUND", message: "Approval not found" });
+        const { roles } = await getIdentityRolesAndPermissions(actorIdentity.id);
+        const role = ctx.user.role === "admin" ? "ADMIN" : roles[0] ?? "USER";
+        // Only ADMIN (or an identity holding administration:manage) may approve.
+        const { permissions } = await getIdentityRolesAndPermissions(actorIdentity.id);
+        const canApprove = role === "ADMIN" || permissions.includes("administration:manage");
+        if (!canApprove) {
+          await createAuditEvent({ actorIdentityId: actorIdentity.id, action: "APPROVAL_DENIED", resourceType: "ASSET", resourceId: approval.id, decision: "DENY", reason: `Role ${role} may not decide approvals`, metadata: { source: "approval-workflow" } }).catch(() => undefined);
+          throw new TRPCError({ code: "FORBIDDEN", message: "Only administrators may decide approvals" });
+        }
+        if (approval.requesterIdentityId === actorIdentity.id) {
+          throw new TRPCError({ code: "FORBIDDEN", message: "Separation of duties: the requester may not approve their own request" });
+        }
+        const updated = await updateAssetApprovalStatus({ approvalId: input.approvalId, status: input.decision, approverIdentityId: actorIdentity.id });
+        if (!updated) throw new TRPCError({ code: "CONFLICT", message: "Approval is no longer pending" });
+        await createAuditEvent({ actorIdentityId: actorIdentity.id, action: input.decision === "APPROVED" ? "APPROVAL_GRANTED" : "APPROVAL_REJECTED", resourceType: "ASSET", resourceId: approval.id, decision: input.decision === "APPROVED" ? "ALLOW" : "DENY", reason: input.reason ?? `Approval ${input.decision.toLowerCase()} by ${actorIdentity.displayName}`, metadata: { source: "approval-workflow", assetId: approval.assetId, requesterIdentityId: approval.requesterIdentityId } }).catch(() => undefined);
+        return updated;
+      }),
+  }),
+  /** Complete asset provenance (LOOP 9): real chain evidence + custody read model. */
+  provenance: protectedProcedure.input(z.object({ assetId: z.string().uuid() })).query(async ({ input }) => {
+    const asset = await getAssetById(input.assetId);
+    if (!asset) throw new TRPCError({ code: "NOT_FOUND", message: "Asset not found" });
+    const operatorKey = besuBlockchainService?.config.privateKey ?? null;
+    let onChain: { custodian: string | null; status: string | null } | null = null;
+    if (besuBlockchainService) {
+      const record = await besuBlockchainService.getAsset(asset.assetId).catch(() => null);
+      if (record) onChain = { custodian: record.custodian ?? null, status: String(record.status ?? "") || null };
+    }
+    return buildAssetProvenance({
+      assetRowId: asset.id,
+      onChain,
+      deriveWallet: operatorKey ? (did: string) => deriveIdentityWallet(operatorKey, did) : undefined,
+    });
+  }),
+  /**
+   * Policy simulator (LOOP 10): runs the SAME authorization engine on a
+   * hypothetical input without executing anything. ADMIN-only to prevent
+   * policy probing by unprivileged roles; the result is clearly labelled a
+   * dry run and persists NO decision rows.
+   */
+  simulator: adminProcedure
+    .input(z.object({
+      role: z.enum(["ADMIN", "MANAGER", "AUDITOR", "USER"]),
+      identityStatus: z.enum(["ACTIVE", "SUSPENDED", "REVOKED"]).default("ACTIVE"),
+      assetClassification: z.enum(["PUBLIC", "CONTROLLED", "SENSITIVE", "HIGHLY_SENSITIVE", "CRITICAL"]),
+      action: z.enum(["TRANSFER", "CREATE_ASSET", "READ"]),
+      stepUpAuthenticated: z.boolean().default(false),
+      approvalStatus: z.enum(["PENDING", "APPROVED", "REJECTED", "EXECUTED"]).optional(),
+      riskLevel: z.enum(["LOW", "MEDIUM", "HIGH"]).optional(),
+      custodyMatch: z.boolean().default(true),
+    }))
+    .mutation(async ({ input }) => {
+      const permissionFor = (action: string) => ({ READ: "asset:read", TRANSFER: "asset:transfer", CREATE_ASSET: "asset:create" })[action] ?? "asset:read";
+      const rolePermissions: Record<string, string[]> = {
+        ADMIN: ["administration:manage"],
+        MANAGER: [permissionFor(input.action)],
+        AUDITOR: ["asset:read"],
+        USER: ["asset:read"],
+      };
+      const result = authorizationService.evaluate({
+        identityStatus: input.identityStatus,
+        role: input.role,
+        permissions: rolePermissions[input.role] ?? [],
+        resourceType: "asset",
+        action: input.action,
+        assetClassification: input.assetClassification,
+        actorIdentityId: "simulated-actor",
+        currentCustodianIdentityId: input.custodyMatch ? "simulated-actor" : "other-custodian",
+        approvalStatus: input.approvalStatus,
+        riskLevel: input.riskLevel,
+        context: { stepUpAuthenticated: input.stepUpAuthenticated, approvalRequired: input.assetClassification === "HIGHLY_SENSITIVE" || input.assetClassification === "CRITICAL" },
+      });
+      await createAuditEvent({ actorIdentityId: null, action: "POLICY_SIMULATED", resourceType: "POLICY", resourceId: result.decisionId, decision: result.decision, reason: `Simulated ${input.role}/${input.action}/${input.assetClassification} → ${result.decision}`, metadata: { source: "policy-simulator", dryRun: true, input } }).catch(() => undefined);
+      return { ...result, input, dryRun: true as const };
+    }),
+  /**
+   * The Graph query layer (LOOP 11) — READ-ONLY indexing/query surface over
+   * REAL contract events. NEVER consulted for authorization decisions; the
+   * core application works identically when unavailable.
+   */
+  graph: router({
+    status: protectedProcedure.query(() => graphQueryService.status()),
+    asset: protectedProcedure.input(z.object({ assetId: z.string().min(2).max(160) })).query(({ input }) => graphQueryService.getAsset(input.assetId)),
+    provenance: protectedProcedure.input(z.object({ assetId: z.string().min(2).max(160) })).query(({ input }) => graphQueryService.getProvenance(input.assetId)),
+    identity: protectedProcedure.input(z.object({ wallet: z.string().regex(/^0x[0-9a-fA-F]{40}$/) })).query(({ input }) => graphQueryService.getIdentity(input.wallet)),
+    roleEvents: protectedProcedure.query(() => graphQueryService.getRoleEvents()),
   }),
 });
 

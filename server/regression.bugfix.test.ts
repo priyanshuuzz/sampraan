@@ -25,6 +25,13 @@ const dbMocks = vi.hoisted(() => ({
   createDidRecord: vi.fn(),
   applyCustodyTransfer: vi.fn(),
   applyIdentityStatusChange: vi.fn(),
+  getDb: vi.fn(async () => null),
+  getActiveAssetApproval: vi.fn(),
+  createAssetApproval: vi.fn(),
+  getAssetApproval: vi.fn(),
+  listAssetApprovals: vi.fn(),
+  updateAssetApprovalStatus: vi.fn(),
+  markAssetApprovalExecuted: vi.fn(),
   applyAssetStatusChange: vi.fn(),
 }));
 
