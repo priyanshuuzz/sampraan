@@ -17,6 +17,8 @@
  */
 import { createWriteStream } from "node:fs";
 void createWriteStream;
+import "dotenv/config";
+import { keccak256, solidityPacked, toUtf8Bytes, Wallet } from "ethers";
 
 const BASE = process.env.SAMPPRAAN_BASE_URL ?? "http://localhost:3000";
 const API = `${BASE}/api/trpc`;
@@ -133,14 +135,36 @@ const adminOp = await api.call("identities.create", { displayName: "X Y", organi
 check("admin-only operation rejected (403)", !adminOp.ok && adminOp.status === 403, `status=${adminOp.status} ${adminOp.error}`);
 
 // ============================================================
-log("\n=== TEST 5 — MANAGER TRANSFER (ALLOW → real chain tx) ===");
+log("\n=== TEST 5 — MANAGER TRANSFER (ALLOW/CHALLENGE → real chain tx) ===");
 const managerIdentityList = await api.call("identities.list");
 const userIdentity = managerIdentityList.data?.find(i => i.roles?.includes("USER") && !i.roles?.includes("MANAGER"));
-const managerTransfer = await api.call(
+const managerDid = managerIdentityList.data?.find(i => i.linkedUserId === manager.user?.id)?.did;
+check("manager identity DID resolved", !!managerDid, managerDid);
+let managerTransfer = await api.call(
   "assets.authorizeTransfer",
   { assetId: assetRowId, recipientIdentityId: userIdentity.id },
   { method: "POST" },
 );
+
+// CHALLENGE path (POLICY-STEP-UP / POLICY-RISK-ELEVATION): the policy demands
+// additional verification. Perform a REAL server-verified step-up — sign the
+// server-issued nonce with the manager identity's derived wallet key, exactly
+// as the production flow does — then re-evaluate the policy.
+if (managerTransfer.data?.decision === "CHALLENGE") {
+  check("policy decision CHALLENGE (step-up required)", true, managerTransfer.data?.policyId ?? managerTransfer.data?.reason);
+  const challenge = await api.call("stepup.requestChallenge", { assetId: assetRowId }, { method: "POST" });
+  check("step-up challenge issued", challenge.ok && /^.{16,128}$/.test(challenge.data?.nonce ?? ""), challenge.error ?? challenge.data?.nonce);
+  const operatorKey = process.env.BLOCKCHAIN_PRIVATE_KEY;
+  const seed = keccak256(solidityPacked(["bytes32", "string"], [keccak256(toUtf8Bytes(operatorKey)), managerDid]));
+  const signature = await new Wallet(seed).signMessage(challenge.data.message);
+  const verify = await api.call("stepup.verify", { assetId: assetRowId, nonce: challenge.data.nonce, signature }, { method: "POST" });
+  check("step-up signature verified server-side", verify.ok && verify.data?.ok === true, verify.error);
+  managerTransfer = await api.call(
+    "assets.authorizeTransfer",
+    { assetId: assetRowId, recipientIdentityId: userIdentity.id },
+    { method: "POST" },
+  );
+}
 check("policy decision ALLOW", managerTransfer.data?.decision === "ALLOW", managerTransfer.data?.decision ?? managerTransfer.error);
 check("transaction confirmed", managerTransfer.data?.transaction?.status === "CONFIRMED", managerTransfer.data?.transaction?.transactionHash);
 check("AssetTransferred evidence in tx", (JSON.stringify(managerTransfer.data?.transaction?.events ?? managerTransfer.data?.transaction ?? {})).length > 10);

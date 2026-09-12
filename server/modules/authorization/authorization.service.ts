@@ -137,11 +137,14 @@ export class AuthorizationService {
     }
 
     // ABAC — advisory risk: security intelligence can ELEVATE a normally
-    // allowed operation to a challenge for HIGH risk. It can NEVER grant —
+    // allowed operation to a challenge for HIGH risk. The additional
+    // verification that clears the challenge is a server-verified step-up
+    // session for this exact operation; risk can NEVER grant on its own —
     // every earlier DENY/CHALLENGE above already returned.
     if (
       request.riskLevel === "HIGH" &&
-      (request.action === "TRANSFER" || request.action === "CREATE_ASSET")
+      (request.action === "TRANSFER" || request.action === "CREATE_ASSET") &&
+      request.context?.stepUpAuthenticated !== true
     ) {
       return {
         decision: "CHALLENGE",

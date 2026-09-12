@@ -108,6 +108,15 @@ describe("Advisory risk elevation (POLICY-RISK-ELEVATION)", () => {
     expect(result.policyId).toBe("POLICY-RISK-ELEVATION");
   });
 
+  it("a server-verified step-up satisfies the HIGH-risk challenge (transfer)", () => {
+    const result = authorizationService.evaluate({
+      ...base,
+      riskLevel: "HIGH",
+      context: { stepUpAuthenticated: true },
+    });
+    expect(result.decision).toBe("ALLOW");
+  });
+
   it("risk can NEVER grant: HIGH risk does not override a permission DENY", () => {
     const result = authorizationService.evaluate({
       ...base,

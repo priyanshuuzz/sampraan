@@ -12,7 +12,7 @@ type Asset @entity {
   custodian: Bytes!            # current custodian wallet
   creator: Bytes               # initial custodian from AssetRegistered
   mintTransactionHash: Bytes
-  mintBlockNumber: Int
+  mintBlockNumber: BigInt
   mintedAt: BigInt
   registeredAt: BigInt!
   updatedAt: BigInt!
@@ -27,7 +27,7 @@ type AssetTransfer @entity {
   toCustodian: Bytes!
   operator: Bytes!
   transactionHash: Bytes!
-  blockNumber: Int!
+  blockNumber: BigInt!
   blockTimestamp: BigInt!
 }
 
@@ -45,7 +45,7 @@ type BlockchainEvent @entity {
   id: ID!                      # txHash-logIndex
   contract: String!            # SampraanAssetRegistry | SampraanIdentityRegistry | SampraanAccessControl
   eventName: String!           # AssetRegistered | AssetTransferred | IdentityRegistered | ...
-  blockNumber: Int!
+  blockNumber: BigInt!
   blockTimestamp: BigInt!
   transactionHash: Bytes!
   payload: String              # JSON-encoded indexed args (query convenience)

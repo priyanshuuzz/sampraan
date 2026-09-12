@@ -19,23 +19,45 @@ from `blockchain/deployment.json` — update them after a redeploy.
 - `Identity` — reference wallet, didDigest, lifecycle status
 - `BlockchainEvent` — raw event stream across all three contracts
 
-## Local deployment (requires graph-node + IPFS + Postgres)
+## Local deployment (VERIFIED LIVE)
 
-The dev stack (`docker compose -f blockchain/network/docker-compose.yml up -d`)
-provides Besu only. To run a full graph-node locally add the standard
-graph-node/ipfs/postgres services, then:
+The graph stack lives in `docker-compose.graph.yml` and attaches to the
+EXISTING `sampraan-chain` docker network so graph-node indexes the Besu
+validators directly:
 
 ```bash
-pnpm graph:codegen   # graph codegen --output-dir graph/generated graph/subgraph.yaml
-pnpm graph:build     # graph build graph/subgraph.yaml
-pnpm graph:create    # graph create --node http://localhost:8020 sampraan
-pnpm graph:deploy    # graph deploy --node http://localhost:8020 --ipfs http://localhost:5001 sampraan graph/subgraph.yaml
+# 1. Besu QBFT network (4 validators) — already running
+pnpm blockchain:start
+
+# 2. Graph stack (IPFS + Postgres + graph-node)
+docker compose -f graph/docker-compose.graph.yml up -d
+# Postgres is initialized with POSTGRES_INITDB_ARGS="--locale=C" — graph-node
+# refuses any other collation.
+
+# 3. Build + deploy the subgraph (run from inside graph/)
+cd graph && pnpm install
+cd graph && pnpm exec graph codegen
+cd graph && pnpm exec graph build
+cd graph && pnpm exec graph create sampraan --node http://localhost:8020
+cd graph && pnpm exec graph deploy sampraan --node http://localhost:8020 \
+  --ipfs http://localhost:5001 --version-label v1.0.0
 ```
+
+Query endpoint: `http://localhost:8000/subgraphs/name/sampraan`
+(indexing status: `http://localhost:8030/graphql`).
+
+Verified live on the QBFT network: a REAL admin mint (token 53, block 52498,
+tx `0x7b5035c1…`) followed by a REAL custody assignment and a REAL policy-
+authorized transfer (tx `0x5ccf4ad5…`, block 52505) were all indexed by
+graph-node within seconds and returned by GraphQL queries with exact tx
+hashes, custodians and block numbers.
 
 Query example after deployment:
 
 ```graphql
-{ assets { id status custodian { id } creator mintTransactionHash transfers { kind transactionHash blockNumber } } }
+{ assetTransfers(first: 5, orderBy: blockNumber, orderDirection: desc) {
+    kind asset { id } fromCustodian toCustodian transactionHash blockNumber
+} }
 ```
 
 ## Availability contract (IMPORTANT)

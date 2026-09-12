@@ -1,0 +1,70 @@
+# SAMPRAAN — local The Graph stack (LOOP 11 live verification)
+#
+# Brings up IPFS + PostgreSQL + graph-node and attaches them to the EXISTING
+# `sampraan-chain` docker network so graph-node can index the Besu validators
+# directly via `sampraan-validator-1:8545`.
+#
+# Start:  docker compose -f graph/docker-compose.graph.yml up -d
+# Stop:   docker compose -f graph/docker-compose.graph.yml down -v
+#
+# The Graph is an INDEXING/QUERY layer only. The SAMPRAAN core application
+# (auth, RBAC/ABAC, smart-contract authorization, custom indexer) must keep
+# working with this stack stopped.
+
+services:
+  ipfs:
+    image: ipfs/kubo:v0.27.0
+    container_name: sampraan-ipfs
+    networks:
+      - sampraan-chain
+    volumes:
+      - ipfs-data:/data/ipfs
+    ports:
+      - "127.0.0.1:5001:5001"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: sampraan-graph-postgres
+    networks:
+      - sampraan-chain
+    environment:
+      POSTGRES_USER: graph
+      POSTGRES_PASSWORD: let-me-in
+      POSTGRES_DB: graph-node
+      # graph-node requires the C collation; this is its documented setup.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
+  graph-node:
+    image: graphprotocol/graph-node:v0.35.0
+    container_name: sampraan-graph-node
+    depends_on:
+      - ipfs
+      - postgres
+    networks:
+      - sampraan-chain
+    environment:
+      postgres_host: postgres
+      postgres_user: graph
+      postgres_pass: let-me-in
+      postgres_db: graph-node
+      ipfs: ipfs:5001
+      # Besu QBFT network — instant blocks, no finality wait needed for demo.
+      ethereum: besu:http://sampraan-validator-1:8545
+      GRAPH_LOG: info
+      # Poll frequently; the local chain produces blocks quickly.
+      ETHEREUM_POLLING_INTERVAL: 2000
+      # Follow chain head eagerly (small local network).
+      ETHEREUM_ANCESTOR_COUNT: 50
+    ports:
+      - "127.0.0.1:8000:8000" # GraphQL HTTP
+      - "127.0.0.1:8020:8020" # JSON-RPC admin (subgraph deploy)
+
+volumes:
+  ipfs-data:
+  pg-data:
+
+networks:
+  sampraan-chain:
+    external: true

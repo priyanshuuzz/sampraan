@@ -1,5 +1,4 @@
-specVersion: 1.0.0
-indexerVersion: v0.0.1
+specVersion: 0.0.5
 description: SAMPRAAN identity, asset, and role event indexing (LOOP 11)
 repository: https://github.com/bel-sih-2026/sampraan
 schema:
@@ -30,7 +29,7 @@ dataSources:
           handler: handleAssetAssigned
         - event: AssetTransferred(indexed uint256,indexed bytes32,indexed address,address,address,uint64)
           handler: handleAssetTransferred
-        - event: AssetStatusChanged(indexed uint256,indexed bytes32,uint8,uint8,address,uint64)
+        - event: AssetStatusChanged(indexed uint256,indexed bytes32,uint8,uint8,indexed address,uint64)
           handler: handleAssetStatusChanged
       file: ./mappings/asset-registry.ts
   - kind: ethereum

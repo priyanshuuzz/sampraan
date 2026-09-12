@@ -223,14 +223,22 @@ export async function setDidKeyStatus(did: string, keyStatus: "ACTIVE" | "REVOKE
 /* Server-verified step-up sessions (LOOP 5)                           */
 /* ------------------------------------------------------------------ */
 
-/** Deterministic canonical step-up message (what the caller must sign). */
-function buildStepUpMessage(identityId: string, purpose: string, nonce: string, expiresAt: Date): string {
+/** Deterministic canonical step-up message (what the caller must sign).
+ * SECURITY: the message binds the challenge to the identity and the exact
+ * operation purpose via the single-use nonce — it deliberately EXCLUDES the
+ * expiry timestamp. Expiry is enforced server-side from the authoritative
+ * DB row at consume time (the driver's timestamp round-trip is not stable
+ * across timezones, and a signed clock value would break verification
+ * without adding security: the nonce is the entropy, the DB row is the
+ * expiry authority).
+ */
+function buildStepUpMessage(identityId: string, purpose: string, nonce: string): string {
   return [
     "SAMPRAAN Step-Up Verification",
     `Identity: ${identityId}`,
     `Purpose: ${purpose}`,
     `Nonce: ${nonce}`,
-    `Expires: ${expiresAt.toISOString()}`,
+    "Signing this message is a re-authentication proof for the bound purpose only.",
   ].join("\n");
 }
 
@@ -249,7 +257,7 @@ export async function createStepUpChallenge(identityId: string, purpose: string)
     nonce,
     expiresAt,
   });
-  return { nonce, message: buildStepUpMessage(identityId, purpose, nonce, expiresAt), expiresAt: expiresAt.toISOString() };
+  return { nonce, message: buildStepUpMessage(identityId, purpose, nonce), expiresAt: expiresAt.toISOString() };
 }
 
 /**
@@ -280,7 +288,7 @@ export async function verifyStepUpChallenge(input: { identityId: string; purpose
   const session = rows[0];
   let recovered: string;
   try {
-    recovered = verifyMessage(buildStepUpMessage(session.identityId, session.purpose, session.nonce, session.expiresAt), input.signature);
+    recovered = verifyMessage(buildStepUpMessage(session.identityId, session.purpose, session.nonce), input.signature);
   } catch {
     return { ok: false, reason: "Step-up signature is malformed", code: "SIGNATURE_INVALID" };
   }
