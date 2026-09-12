@@ -51,13 +51,16 @@ function contentSecurityPolicy(): string {
     ? "script-src 'self'"
     : "script-src 'self' 'unsafe-inline'";
   // Tailwind/Radix components legitimately rely on inline style attributes.
-  const styleSrc = "style-src 'self' 'unsafe-inline'";
+  // The Google Fonts stylesheet/hosts are allowed as the sole third-party
+  // origin: the UI loads Plus Jakarta Sans / JetBrains Mono / Caveat from it.
+  const styleSrc =
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com";
   return [
     "default-src 'self'",
     scriptSrc,
     styleSrc,
     "img-src 'self' data:",
-    "font-src 'self' data:",
+    "font-src 'self' data: https://fonts.gstatic.com",
     "connect-src 'self'",
     "object-src 'none'",
     "base-uri 'self'",
