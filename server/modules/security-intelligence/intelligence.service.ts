@@ -74,7 +74,7 @@ export class SecurityIntelligenceService {
    */
   async scan(input: { windowEvents?: number } = {}): Promise<IntelligenceScanResult> {
     const window = input.windowEvents ?? DEFAULT_WINDOW;
-    const events = await listAuditEvents(window).catch(() => [] as AuditEvent[]);
+    const events = (await Promise.resolve(listAuditEvents(window)).catch(() => [] as AuditEvent[])) ?? ([] as AuditEvent[]);
     if (events.length === 0) {
       return { scanned: 0, created: 0, suppressed: 0, rules: [] };
     }

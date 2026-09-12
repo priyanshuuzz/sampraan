@@ -20,7 +20,7 @@
  * ALLOW/DENY/CHALLENGE decisions — the policy engine and smart contracts
  * remain the only authorities.
  */
-import { Contract, WebSocketProvider, type EventLog } from "ethers";
+import { Contract, JsonRpcProvider, type EventLog } from "ethers";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -66,11 +66,16 @@ export interface GraphProvenance {
 const STATUS_NAMES = ["NONE", "PENDING", "ACTIVE", "SUSPENDED", "REVOKED"] as const;
 const IDENTITY_STATUS_NAMES = ["NONE", "ACTIVE", "SUSPENDED", "REVOKED"] as const;
 
-/** Scan window: QBFT produces blocks fast; a bounded window keeps queries fast. */
-const DEFAULT_WINDOW = 20_000;
+/**
+ * Scan window: QBFT produces blocks fast and this Besu RPC caps eth_getLogs
+ * ranges (~5k blocks observed live), so the window stays under the cap. The
+ * subgraph (graph-node) is the full-history indexer; this client covers the
+ * recent window by design.
+ */
+const DEFAULT_WINDOW = 5_000;
 
 export class GraphQueryService {
-  private provider: WebSocketProvider | null = null;
+  private provider: JsonRpcProvider | null = null;
   private assetRegistry: Contract | null = null;
   private identityRegistry: Contract | null = null;
   private accessControl: Contract | null = null;
@@ -88,7 +93,11 @@ export class GraphQueryService {
       const rpcUrl: string | undefined = process.env.BLOCKCHAIN_RPC_URL ?? deployment.rpcUrl;
       if (!rpcUrl || !deployment.contracts?.SampraanAssetRegistry) return false;
       this.addresses = deployment.contracts;
-      this.provider = new WebSocketProvider(rpcUrl.replace(/^http/, "ws").replace(/ws:\/\//, "ws://"));
+      // HTTP JSON-RPC (static call + log queries only). A websocket provider
+      // here kept a live socket whose 'error' event crashed the API process
+      // when the Besu WS port was unreachable — unacceptable for an
+      // advisory query layer. JsonRpcProvider is connectionless per request.
+      this.provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
       const assetArtifact = JSON.parse(
         readFileSync(resolve(process.cwd(), "blockchain/artifacts/SampraanAssetRegistry.json"), "utf8"),
       );
@@ -123,13 +132,14 @@ export class GraphQueryService {
     }
   }
 
-  /** Asset entity by its off-chain assetId (the digest input the contract stores). */
+  /** Asset entity by its off-chain assetId (resolved via the contract's digest index). */
   async getAsset(assetId: string): Promise<GraphAsset | null> {
     if (!this.ensureContracts() || !this.assetRegistry || !this.provider) return null;
     try {
-      const { keccak256, toUtf8Bytes, zeroPadValue } = await import("ethers");
+      const { keccak256, toUtf8Bytes } = await import("ethers");
       const digest = keccak256(toUtf8Bytes(assetId));
-      const tokenId: bigint = await this.assetRegistry.tokenIdForAssetId(zeroPadValue(digest, 32));
+      // resolveAssetId(bytes32) is the contract's deterministic digest→token index.
+      const tokenId: bigint = await this.assetRegistry.resolveAssetId(digest);
       if (tokenId === 0n) return null;
       const record = await this.assetRegistry.getAsset(tokenId);
       const mint = await this.findMint(tokenId);
@@ -234,7 +244,7 @@ export class GraphQueryService {
   }
 
   /** Role events from the access-control contract (RoleGranted/RoleRevoked). */
-  async getRoleEvents(windowBlocks = 2000): Promise<{ action: "RoleGranted" | "RoleRevoked"; role: string; account: string; transactionHash: string; blockNumber: number }[]> {
+  async getRoleEvents(windowBlocks = 4_000): Promise<{ action: "RoleGranted" | "RoleRevoked"; role: string; account: string; transactionHash: string; blockNumber: number }[]> {
     if (!this.ensureContracts() || !this.accessControl || !this.provider) return [];
     try {
       const latest = await this.provider.getBlockNumber();

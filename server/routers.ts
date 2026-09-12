@@ -879,7 +879,7 @@ export const appRouter = router({
       // they are recorded in the audit metadata instead of the FK column.
       const auditAction = result.decision === "DENY" ? "AUTHORIZATION_DENIED" : result.decision === "CHALLENGE" ? "AUTHORIZATION_CHALLENGED" : "AUTHORIZATION_ALLOWED";
       // SECURITY: audit metadata records BOTH acting-account coordinates
-      // (Manus openId/role) and the actor's SAMPRAAN identity id, so a denial
+      // (platform openId/role) and the actor's SAMPRAAN identity id, so a denial
       // can never be misattributed to the resource owner.
       const actingUser = { actorUserOpenId: ctx.user.openId, actorUserRole: ctx.user.role };
       const auditMetadata: Record<string, unknown> = { source: "authorization-engine", policyId: result.policyId ?? null, actorOpenId: ctx.user.openId, ...actingUser };

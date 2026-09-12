@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { bigint, boolean, index, int, json, mysqlEnum, mysqlTable, primaryKey, text, timestamp, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
 
 /**
- * Managed template auth user. This table is retained for Manus OAuth and is
+ * Managed template auth user. This table is retained for the OAuth sync flow and is
  * deliberately separate from SAMPRAAN's cryptographic identity model.
  */
 export const users = mysqlTable("users", {

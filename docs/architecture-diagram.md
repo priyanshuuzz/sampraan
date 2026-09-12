@@ -28,7 +28,6 @@ flowchart TB
             SEC["securityHeaders · corsPolicy · rateLimit<br/>requestLogger · 1MB body cap"]
             HEALTH["/health · /ready<br/>(readiness DB-gated, chain best-effort)"]
             OAUTHCB["GET /api/oauth/callback<br/>state-nonce CSRF check"]
-            STORPROXY["GET /manus-storage/*key<br/>presigned download proxy"]
             SDK["sdk.ts — OAuth client + jose JWT sessions<br/>authenticateRequest gate (revocable, identity-aware)"]
         end
 
@@ -71,8 +70,7 @@ flowchart TB
         RPC --> AR
     end
 
-    OAUTHPORTAL["Manus OAuth portal — ExchangeToken · GetUserInfo"]
-    FORGE["Forge storage API — presigned URLs"]
+    OAUTHPORTAL["External OAuth provider — ExchangeToken · GetUserInfo"]
 
     %% ============ FLOWS ============
     TCLIENT -->|"HTTPS · /api/trpc"| SEC
@@ -81,7 +79,6 @@ flowchart TB
     OAUTHCB --> SDK
     SDK -->|"code → token → profile"| OAUTHPORTAL
     SDK -->|"upsertUser · track session"| DBLAYER
-    STORPROXY --> FORGE
 
     TRPCMOUNT --> RAUTH
     TRPCMOUNT --> RASSET
@@ -116,7 +113,7 @@ sequenceDiagram
     autonumber
     participant B as Browser (React SPA)
     participant S as Express server (server/_core)
-    participant M as Manus OAuth portal
+    participant M as External OAuth provider
     participant D as MySQL
 
     B->>B: startLogin() — nonce + __Host-oauth_state cookie

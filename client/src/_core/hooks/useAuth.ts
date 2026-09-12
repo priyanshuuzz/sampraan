@@ -1,6 +1,5 @@
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
-import { startLogin } from "@/const";
 
 export function useAuth() {
   const { data: user, isLoading, error, refetch } = trpc.auth.me.useQuery(undefined, {

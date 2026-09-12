@@ -18,7 +18,7 @@ with sync_playwright() as p:
     # The client expects a cookie-pair string: app_session_id=<token>
     cookie_value = f"app_session_id={token}"
     page.add_init_script(
-        f"sessionStorage.setItem('manus-cookie', {json.dumps(cookie_value)});"
+        f"sessionStorage.setItem('sampraan-session', {json.dumps(cookie_value)});"
     )
     errors = []
     page.on("pageerror", lambda e: errors.append(str(e)))

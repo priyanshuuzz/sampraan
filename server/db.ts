@@ -194,7 +194,7 @@ export async function getAssetById(id: string) {
 }
 
 /**
- * Resolves the SAMPRAAN identity linked to a platform user (Manus auth user id).
+ * Resolves the SAMPRAAN identity linked to a platform user (platform auth user id).
  * Returns undefined when no identity is linked or the database is unavailable.
  */
 export async function getIdentityByLinkedUserId(linkedUserId: number) {
