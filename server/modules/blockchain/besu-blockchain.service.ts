@@ -23,6 +23,7 @@
 import {
   Interface,
   JsonRpcProvider,
+  NonceManager,
   Wallet,
   keccak256,
   toUtf8Bytes,
@@ -83,14 +84,27 @@ function withTimeout<T>(task: Promise<T>, ms: number, what: string): Promise<T> 
 export class BesuBlockchainService {
   readonly config: BlockchainConfig;
   private provider: JsonRpcProvider | null = null;
-  private signer: Wallet | null = null;
+  private signer: NonceManager | null = null;
   private identityContract: SampraanIdentityRegistryHandle | null = null;
   private assetContract: SampraanAssetRegistryHandle | null = null;
   private accessControlContract: SampraanAccessControlHandle | null = null;
   private initPromise: Promise<void> | null = null;
+  /** Serializes submit→mine→evidence cycles; see initialize() BUG-034 note. */
+  private submitMutex: Promise<unknown> = Promise.resolve();
 
   constructor(config: BlockchainConfig = resolveBlockchainConfig()) {
     this.config = config;
+  }
+
+  /**
+   * Run `task` so that at most ONE signed submit→receipt cycle is in flight
+   * for the shared operator key at any time. Failures do not poison the
+   * chain: the next caller starts a fresh link.
+   */
+  enqueueSubmit<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.submitMutex.then(task, task);
+    this.submitMutex = run.catch(() => undefined);
+    return run;
   }
 
   /**
@@ -112,7 +126,16 @@ export class BesuBlockchainService {
     }
 
     this.provider = new JsonRpcProvider(rpcUrl, chainId, { staticNetwork: true });
-    this.signer = new Wallet(privateKey, this.provider);
+    // BUG-034 (presentation reliability): every SAMPRAAN operation — identity
+    // anchor + asset mint + activation during a single create flow, or a
+    // manager transfer racing the periodic indexer — is signed by the SAME
+    // operator key. With a bare Wallet, two concurrent sends both fetch the
+    // same pending nonce, so one replaces the other ("replacement transaction
+    // underpriced" / "already known" / intermittent mint failures).
+    // NonceManager serializes nonce allocation for this signer instance; the
+    // submitMutex below additionally serializes whole submit→receipt cycles
+    // so evidence is recorded in submission order.
+    this.signer = new NonceManager(new Wallet(privateKey, this.provider));
 
     // BUG-014: verify the connected network actually IS the configured chain
     // before binding contract addresses. Without this, a mis-pointed RPC
@@ -203,7 +226,9 @@ export class BesuBlockchainService {
    * requires a reachable chain.
    */
   get operatorAddress(): string {
-    if (this.signer) return this.signer.address;
+    // NonceManager exposes the wrapped signer via its `signer` property.
+    const inner = this.signer?.signer as Wallet | undefined;
+    if (inner) return inner.address;
     if (!this.config.privateKey) {
       throw new Error("Besu service has no operator key configured");
     }
@@ -227,12 +252,16 @@ export class BesuBlockchainService {
     const didDigest = keccak256(toUtf8Bytes(input.did));
     const publicKeyDigest =
       input.publicKeyDigest ?? keccak256(toUtf8Bytes(`pk:${input.did}`));
-    const tx = await this.identityContract!.registerIdentity(
-      input.walletAddress,
-      didDigest,
-      publicKeyDigest
-    );
-    return this.awaitEvidence(tx, "IDENTITY_REGISTER");
+    let evidence: TransactionEvidence;
+    await this.enqueueSubmit(async () => {
+      const tx = await this.identityContract!.registerIdentity(
+        input.walletAddress,
+        didDigest,
+        publicKeyDigest
+      );
+      evidence = await this.awaitEvidence(tx, "IDENTITY_REGISTER");
+    });
+    return evidence!;
   }
 
   async setIdentityStatus(input: {
@@ -244,11 +273,15 @@ export class BesuBlockchainService {
     if (!statusCode) {
       throw new Error(`Invalid identity status: ${input.status}`);
     }
-    const tx = await this.identityContract!.setStatus(
-      input.walletAddress,
-      statusCode
-    );
-    return this.awaitEvidence(tx, "IDENTITY_STATUS_CHANGE");
+    let evidence: TransactionEvidence;
+    await this.enqueueSubmit(async () => {
+      const tx = await this.identityContract!.setStatus(
+        input.walletAddress,
+        statusCode
+      );
+      evidence = await this.awaitEvidence(tx, "IDENTITY_STATUS_CHANGE");
+    });
+    return evidence!;
   }
 
   async getIdentity(walletAddress: string): Promise<{
@@ -290,13 +323,17 @@ export class BesuBlockchainService {
     metadataReference: string;
   }): Promise<TransactionEvidence> {
     await this.ensureInitialized();
-    const tx = await this.assetContract!.registerAsset(
-      keccak256(toUtf8Bytes(input.assetId)),
-      input.custodianWallet,
-      keccak256(toUtf8Bytes(input.classification)),
-      keccak256(toUtf8Bytes(input.metadataReference))
-    );
-    return this.awaitEvidence(tx, "ASSET_REGISTER");
+    let evidence: TransactionEvidence;
+    await this.enqueueSubmit(async () => {
+      const tx = await this.assetContract!.registerAsset(
+        keccak256(toUtf8Bytes(input.assetId)),
+        input.custodianWallet,
+        keccak256(toUtf8Bytes(input.classification)),
+        keccak256(toUtf8Bytes(input.metadataReference))
+      );
+      evidence = await this.awaitEvidence(tx, "ASSET_REGISTER");
+    });
+    return evidence!;
   }
 
   async assignAsset(input: {
@@ -305,8 +342,12 @@ export class BesuBlockchainService {
   }): Promise<TransactionEvidence> {
     await this.ensureInitialized();
     const tokenId = await this.requireAssetToken(input.assetId);
-    const tx = await this.assetContract!.assignAsset(tokenId, input.custodianWallet);
-    return this.awaitEvidence(tx, "ASSET_ASSIGN");
+    let evidence: TransactionEvidence;
+    await this.enqueueSubmit(async () => {
+      const tx = await this.assetContract!.assignAsset(tokenId, input.custodianWallet);
+      evidence = await this.awaitEvidence(tx, "ASSET_ASSIGN");
+    });
+    return evidence!;
   }
 
   /**
@@ -319,11 +360,15 @@ export class BesuBlockchainService {
   }): Promise<TransactionEvidence> {
     await this.ensureInitialized();
     const tokenId = await this.requireAssetToken(input.assetId);
-    const tx = await this.assetContract!.transferCustody(
-      tokenId,
-      input.toCustodianWallet
-    );
-    return this.awaitEvidence(tx, "ASSET_TRANSFER");
+    let evidence: TransactionEvidence;
+    await this.enqueueSubmit(async () => {
+      const tx = await this.assetContract!.transferCustody(
+        tokenId,
+        input.toCustodianWallet
+      );
+      evidence = await this.awaitEvidence(tx, "ASSET_TRANSFER");
+    });
+    return evidence!;
   }
 
   async setAssetStatus(input: {
@@ -333,13 +378,17 @@ export class BesuBlockchainService {
     await this.ensureInitialized();
     const tokenId = await this.requireAssetToken(input.assetId);
     const contract = this.assetContract!;
-    const tx = await {
-      ACTIVATE: () => contract.activateAsset(tokenId),
-      SUSPEND: () => contract.suspendAsset(tokenId),
-      RESTORE: () => contract.restoreAsset(tokenId),
-      REVOKE: () => contract.revokeAsset(tokenId),
-    }[input.status]();
-    return this.awaitEvidence(tx, "ASSET_STATUS_CHANGE");
+    let evidence: TransactionEvidence;
+    await this.enqueueSubmit(async () => {
+      const tx = await {
+        ACTIVATE: () => contract.activateAsset(tokenId),
+        SUSPEND: () => contract.suspendAsset(tokenId),
+        RESTORE: () => contract.restoreAsset(tokenId),
+        REVOKE: () => contract.revokeAsset(tokenId),
+      }[input.status]();
+      evidence = await this.awaitEvidence(tx, "ASSET_STATUS_CHANGE");
+    });
+    return evidence!;
   }
 
   async getAsset(assetId: string): Promise<{

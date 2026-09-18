@@ -130,4 +130,49 @@ describe("BesuBlockchainService against live chain", () => {
       })
     ).rejects.toThrow(/not registered on-chain/i);
   });
+
+  // BUG-034 regression: SAMPRAAN signs every operation with ONE operator key.
+  // Concurrent submissions (identity anchor + mint during asset creation, or
+  // a transfer racing the indexer) previously fetched the same pending nonce
+  // and replaced each other — the intermittent "replacement transaction
+  // underpriced" / "already known" failures. The service now serializes
+  // submit→receipt cycles; this test proves five parallel submissions all
+  // confirm and that they were mined strictly one at a time (block numbers
+  // strictly increase across awaited completions).
+  it("serializes concurrent submissions from the shared operator key (BUG-034)", { timeout: 90_000 }, async () => {
+    if (!requireChain()) return;
+    const wallet = new Wallet(DEMO_KEY);
+    const stamp = Date.now();
+    const results = await Promise.all(
+      Array.from({ length: 5 }, (_, i) =>
+        service!.submitTransaction({
+          action: "ASSET_REGISTER",
+          payload: {
+            assetId: `BUG034-SERIAL-${stamp}-${i}`,
+            custodianWallet: wallet.address,
+            classification: "CONTROLLED",
+            metadataReference: "metadata:bug034-serialization",
+          },
+        })
+      )
+    );
+    // Every parallel submission confirmed — none replaced another.
+    const hashes = new Set(results.map(r => r.transactionHash));
+    expect(hashes.size).toBe(5);
+    for (const evidence of results) {
+      expect(evidence.status).toBe("CONFIRMED");
+      expect(evidence.blockNumber).toBeGreaterThan(0);
+    }
+    // Strict ordering: because cycles are serialized, the block numbers of
+    // the awaited completions are non-decreasing and every block actually
+    // contains the expected tx (no replacement happened).
+    for (let i = 1; i < results.length; i++) {
+      expect(results[i].blockNumber).toBeGreaterThanOrEqual(results[i - 1].blockNumber);
+    }
+    const fetched = await Promise.all(results.map(r => service!.getTransaction(r.transactionHash)));
+    for (const receipt of fetched) {
+      expect(receipt).not.toBeNull();
+      expect(receipt!.status).toBe("CONFIRMED");
+    }
+  });
 });

@@ -462,6 +462,91 @@ describe("SDKServer.authenticateRequest", () => {
       )
     ).rejects.toThrow("Cron session missing task_uid");
   });
+
+  // Session-identity isolation (presentation reliability): every request
+  // re-resolves WHO the actor is from the presented session token alone.
+  // These tests pin the contract the multi-tab SIH demo depends on.
+  it("ISOLATION: re-resolves the actor per request — a replaced session cookie changes the identity on the next call", async () => {
+    const { sdk } = await loadSdk();
+    const { COOKIE_NAME } = await import("../../shared/const");
+    const userToken = await sdk.createSessionToken("user-open-id", { name: "Regular User" });
+    const managerToken = await sdk.createSessionToken("manager-open-id", { name: "Manager" });
+    dbMocks.getUserByOpenId.mockImplementation(async (openId: string) =>
+      signedInUser({ openId, role: openId === "manager-open-id" ? "admin" : "user" })
+    );
+    dbMocks.upsertUser.mockResolvedValue(undefined);
+    dbMocks.getIdentityByLinkedUserId.mockResolvedValue({
+      id: "identity-1",
+      linkedUserId: 1,
+      status: "ACTIVE",
+    });
+
+    // Tab A: session resolves to the regular user.
+    const first = await sdk.authenticateRequest(
+      expressRequest({ cookie: `${COOKIE_NAME}=${userToken}` })
+    );
+    expect(first).toMatchObject({ openId: "user-open-id", role: "user" });
+
+    // Tab B logs in as manager; the browser-wide cookie now carries the
+    // manager token. Tab A's NEXT request must evaluate the manager —
+    // server-side, with no client-trusted state in between.
+    const second = await sdk.authenticateRequest(
+      expressRequest({ cookie: `${COOKIE_NAME}=${managerToken}` })
+    );
+    expect(second).toMatchObject({ openId: "manager-open-id", role: "admin" });
+    expect(second.openId).not.toBe(first.openId);
+  });
+
+  it("ISOLATION: role is ALWAYS derived server-side from the session — a tampered client cannot mint a role", async () => {
+    const { sdk } = await loadSdk();
+    const { COOKIE_NAME } = await import("../../shared/const");
+    const token = await sdk.createSessionToken("user-open-id", { name: "Regular User" });
+    dbMocks.getUserByOpenId.mockResolvedValue(signedInUser({ role: "user" }));
+    dbMocks.upsertUser.mockResolvedValue(undefined);
+    dbMocks.getIdentityByLinkedUserId.mockResolvedValue({
+      id: "identity-1",
+      linkedUserId: 1,
+      status: "ACTIVE",
+    });
+
+    // The role arrives ONLY from the users row keyed by the session's openId.
+    const user = await sdk.authenticateRequest(
+      expressRequest({ cookie: `${COOKIE_NAME}=${token}` })
+    );
+    expect(user.role).toBe("user");
+  });
+
+  it("ISOLATION: two parallel requests carrying different session tokens resolve independently (no cross-talk)", async () => {
+    const { sdk } = await loadSdk();
+    const { COOKIE_NAME } = await import("../../shared/const");
+    const adminToken = await sdk.createSessionToken("admin-open-id", { name: "Admin" });
+    const auditorToken = await sdk.createSessionToken("auditor-open-id", { name: "Auditor" });
+    dbMocks.getUserByOpenId.mockImplementation(async (openId: string) =>
+      signedInUser({ openId, role: openId === "admin-open-id" ? "admin" : "user" })
+    );
+    dbMocks.upsertUser.mockResolvedValue(undefined);
+    dbMocks.getIdentityByLinkedUserId.mockResolvedValue({
+      id: "identity-1",
+      linkedUserId: 1,
+      status: "ACTIVE",
+    });
+
+    // Four contexts (ADMIN/MANAGER/AUDITOR/USER pattern) hammering in
+    // parallel must each get exactly their own identity back.
+    const [admin, auditor, adminAgain, auditorAgain] = await Promise.all([
+      sdk.authenticateRequest(expressRequest({ cookie: `${COOKIE_NAME}=${adminToken}` })),
+      sdk.authenticateRequest(expressRequest({ cookie: `${COOKIE_NAME}=${auditorToken}` })),
+      sdk.authenticateRequest(expressRequest({ cookie: `${COOKIE_NAME}=${adminToken}` })),
+      sdk.authenticateRequest(expressRequest({ cookie: `${COOKIE_NAME}=${auditorToken}` })),
+    ]);
+
+    expect(admin.openId).toBe("admin-open-id");
+    expect(adminAgain.openId).toBe("admin-open-id");
+    expect(auditor.openId).toBe("auditor-open-id");
+    expect(auditorAgain.openId).toBe("auditor-open-id");
+    expect(admin.role).toBe("admin");
+    expect(auditor.role).toBe("user");
+  });
 });
 
 describe("SDKServer.getUserInfo derives loginMethod", () => {

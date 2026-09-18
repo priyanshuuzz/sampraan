@@ -222,6 +222,26 @@ Other scripts: `pnpm run check` (tsc --noEmit), `pnpm run format` (Prettier), `p
 
 Open **http://localhost:3000**. Unauthenticated visitors see the landing page and a workspace demo mode; signing in via the OAuth gate (`VITE_OAUTH_PORTAL_URL` configured) enters the live workspace. Local demo sessions can be minted with `node scripts/provision-admin.mjs` / `provision-user.mjs` (dev-only helpers).
 
+### Multi-user demo sessions (SIH presentation)
+
+The session is an HttpOnly `app_session_id` cookie scoped to the browser **profile** — every tab of the same profile shares it, and the server always resolves identity/role from that cookie server-side. Consequences for the demo:
+
+- Logging in as a second user **in another tab of the same profile** replaces the shared session: every tab then re-resolves to the new user (this is standard cookie behavior, not a defect, and it can never grant privileges — the server decides).
+- To present **four simultaneous, isolated users** (ADMIN / MANAGER / AUDITOR / USER), run each login in a separate browser context — one of:
+  - Chrome/Edge **profiles** (top-right profile switcher), or
+  - a normal window + separate **InPrivate/Incognito** windows, or
+  - Chrome **user-data-dir** shortcuts per role.
+
+Each context keeps its own real login/session; actions never cross contexts, and logging out in one does not affect the others.
+
+Recommended flow:
+
+```bash
+pnpm run seed:demo      # prints the four demo logins
+pnpm run dev            # http://localhost:3000
+# then: profile-1 → admin login · profile-2 → manager · profile-3 → auditor · profile-4 → user
+```
+
 ---
 
 ## Environment Variables

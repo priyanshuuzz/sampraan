@@ -512,3 +512,66 @@ describe("assets.authorizeTransfer — client input cannot bypass policy", () =>
     expectAuditActorRecorded();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Suite 3: session-identity isolation (presentation reliability).
+// The session cookie is browser-wide, so all tabs of one profile share one
+// session; the server resolves WHO the actor is from that session on every
+// request. These tests pin the server-side identity contract the presentation
+// flow depends on: the actor is ALWAYS derived from ctx.user (the session),
+// NEVER from client-supplied identity fields — so when one tab's login
+// replaces the shared cookie, the next request in any tab simply re-resolves
+// to the new session's identity (no stale privilege, no spoofed actor).
+// ---------------------------------------------------------------------------
+describe("session-identity isolation (server-resolved actor)", () => {
+  it("resolves the actor identity from the SESSION's user.id, not from client input (a second tab's login replaces the actor cleanly)", async () => {
+    // Tab 2 logs in as admin; the shared cookie now carries admin's session.
+    // Tab 1's next transfer request must evaluate the ADMIN's identity —
+    // whatever ctx.user holds — and never a cached client-side actor.
+    const adminSession = makeUser({ id: 2, openId: "admin-open-2", role: "admin" });
+    const adminIdentity = { ...activeIdentity, id: "0e0d3b1a-9999-4ccc-8ddd-444455551111", linkedUserId: 2 };
+    mockedGetIdentityByLinkedUserId.mockImplementation(async (userId: number) =>
+      userId === 2 ? adminIdentity : activeIdentity
+    );
+    mockedGetRolesAndPermissions.mockResolvedValue({ roles: ["ADMIN"], permissions: ["administration:manage"] });
+    mockedGetAssetById.mockResolvedValue({ ...activeAsset, classification: "CONTROLLED" });
+    mockedGetIdentityById.mockResolvedValue(activeOwnerIdentity);
+
+    const caller = appRouter.createCaller(makeContext(adminSession));
+    const result = await caller.assets.authorizeTransfer(transferInput);
+
+    // The decision row is attributed to the identity LINKED TO THE SESSION
+    // user (id 2), proving the actor came from the session, not client state.
+    expect(mockedCreateDecision).toHaveBeenCalledTimes(1);
+    expect(mockedCreateDecision.mock.calls[0][0].actorIdentityId).toBe(adminIdentity.id);
+    expect(result.decision).toBe("ALLOW");
+  });
+
+  it("a stale session (logged-out/revoked cookie) yields UNAUTHORIZED — no privileged call slips through from a stale tab", async () => {
+    const caller = appRouter.createCaller(makeContext(null));
+    await expect(
+      caller.assets.authorizeTransfer(transferInput)
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    expect(mockedCreateDecision).not.toHaveBeenCalled();
+  });
+
+  it("a client-asserted identity field cannot re-point the actor at another identity", async () => {
+    // Even if a tampered client sends a different actorIdentityId, the input
+    // schema only carries assetId — there is no identity field to spoof.
+    const caller = appRouter.createCaller(makeContext(makeUser()));
+    const hostile = {
+      assetId: activeAsset.id,
+      actorIdentityId: "0e0d3b1a-aaaa-4bbb-8ccc-444455559999",
+      role: "ADMIN",
+      status: "ACTIVE",
+    } as unknown as Parameters<typeof caller.assets.authorizeTransfer>[0];
+
+    mockedGetIdentityByLinkedUserId.mockResolvedValue(undefined);
+    const result = await caller.assets.authorizeTransfer(hostile);
+
+    // The session's user has NO linked identity ⇒ DENY regardless of the
+    // spoofed fields; no decision row for the spoofed identity either.
+    expect(result.decision).toBe("DENY");
+    expect(mockedCreateDecision).not.toHaveBeenCalled();
+  });
+});
