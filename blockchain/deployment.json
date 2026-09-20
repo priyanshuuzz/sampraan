@@ -2,7 +2,7 @@
   "network": "SAMPRAAN-LOCAL-QBFT",
   "chainId": 4224,
   "rpcUrl": "http://localhost:8545",
-  "deployedAt": "2026-09-09T00:59:24.826Z",
+  "deployedAt": "2026-09-20T13:03:41.566Z",
   "deployerAddress": "0xFE3B557E8Fb62b89F4916B721be55cEb828dBd73",
   "auditorAddress": "0x627306090abaB3A6e1400e9345bC60c78a8BEf57",
   "contracts": {

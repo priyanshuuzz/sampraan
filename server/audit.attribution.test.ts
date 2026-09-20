@@ -32,7 +32,7 @@ const blockchainMocks = vi.hoisted(() => ({
   getTransaction: vi.fn(),
   getEvents: vi.fn(),
   operatorAddress: null as string | null,
-  mode: "MOCK" as const,
+  mode: "MOCK" as "BESU" | "MOCK",
   besu: null,
 }));
 
@@ -45,7 +45,7 @@ vi.mock("./modules/blockchain/blockchain.service", () => ({
     getTransaction: blockchainMocks.getTransaction,
     getEvents: blockchainMocks.getEvents,
     operatorAddress: blockchainMocks.operatorAddress,
-    mode: blockchainMocks.mode,
+    get mode() { return blockchainMocks.mode; },
   },
   besuBlockchainService: blockchainMocks.besu,
 }));

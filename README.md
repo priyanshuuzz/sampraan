@@ -430,18 +430,29 @@ This is a **permissioned** network: four known QBFT validators under determinist
 pnpm test          # full suite (Vitest)
 ```
 
-Current verified state at the release candidate: **23 test files, 293 tests, all passing** — including 13 live Besu QBFT smart-contract tests. Live-chain tests deploy their own contract suite and self-skip when the chain is unreachable, so `pnpm test` also passes in CI without Docker.
+Current verified state at the release candidate: **28 test files, 398 tests, all passing** — including 13 live Besu QBFT smart-contract tests. Live-chain tests deploy their own contract suite and self-skip when the chain is unreachable, so `pnpm test` also passes in CI without Docker.
 
 | Category                    | Files                                                                                                                                             | Coverage                                                                                                                             |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | Unit                        | `authorization.service`, `trust-domain`, `security`, `cookies`, `error-handler`, `sampraan` (client helpers), `db-errors`, `paths`, `besu-config` | Policy engine, CORS/headers/rate-limit, cookie policy, display helpers, no-DB degradation                                            |
-| Session/auth                | `sdk`, `sdk.session`, `oauth`, `auth.logout`, `auth.session-tracking`, `audit.attribution`                                                        | JWT sign/verify, appId binding, foreign secret, tamper/expiry/garbage, CSRF nonce, revocation, actor attribution                     |
-| Integration (tRPC)          | `routers.test`, `routers.security.test`, `regression.bugfix`, `db.test`                                                                           | Full procedure paths with the DB layer mocked: client-bypass attempts, step-up behavior, custody read-model sync, duplicate handling |
-| Smart contract (live chain) | `besu-contracts` (13)                                                                                                                             | Identity/asset/role authorization, lifecycle freeze, transfer rejection, evidence retrieval                                          |
-| Blockchain adapter          | `besu-adapter`, `blockchain.service`, `status-timeout`                                                                                            | Provider connection, submission, receipt parsing, hung-RPC degradation                                                               |
+| Session/auth                | `sdk`, `sdk.session`, `oauth`, `auth.logout`, `auth.session-tracking`, `audit.attribution`                                                        | JWT sign/verify, appId binding, foreign secret, tamper/expiry/garbage, CSRF nonce, revocation, actor attribution                     || Integration (tRPC)          | `routers.test`, `routers.security.test`, `regression.bugfix`, `db.test`                                                                           | Full procedure paths with the DB layer mocked: client-bypass attempts, step-up behavior, custody read-model sync, duplicate handling |
+| Audit hardening             | `audit-hardening`                                                                                                                                 | PORT misconfiguration refusal, login throttle, zero-key refusal, scrypt memory guard, MOCK-mode fail-closed transfers, approval→recipient binding, DID key IDOR, indexer checkpoint resume, login-failure intelligence rule |
+| Blockchain adapter          | `besu-adapter`, `blockchain.service`, `status-timeout`                                                                                            | Provider connection, submission, receipt parsing, hung-RPC degradation, single-signer nonce discipline |
 | E2E (local, optional)       | `scripts/frontend-verify.py`, `scripts/ui-flow-a.py`                                                                                              | Playwright-driven UI proofs of the transfer flow and custody state — run manually, not part of `pnpm test`                           |
 
 Also run: `pnpm run check` (typecheck), `pnpm run build`, `pnpm run contracts:compile`.
+
+### Live end-to-end verification (real chain + real DB)
+
+With MySQL and the Besu network running (`pnpm run blockchain:start`):
+
+```bash
+pnpm run verify:acceptance              # full SIH flow: 4 logins → create → mint → assign → transfer → denials → audit evidence
+node server/verify-security.mjs         # DID challenge/replay, step-up binding, policy simulator, graph/provenance
+node scripts/verify-session-isolation.mjs  # four PARALLEL sessions stay isolated (cookies, roles, logout)
+```
+
+All three must report every check PASS before a presentation.
 
 ---
 

@@ -20,7 +20,7 @@ void createWriteStream;
 import "dotenv/config";
 import { keccak256, solidityPacked, toUtf8Bytes, Wallet } from "ethers";
 
-const BASE = process.env.SAMPPRAAN_BASE_URL ?? "http://localhost:3000";
+const BASE = process.env.SAMPRAAN_BASE_URL ?? "http://localhost:3000";
 const API = `${BASE}/api/trpc`;
 const report = [];
 function log(line = "") {

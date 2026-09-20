@@ -19,6 +19,32 @@ import type { Asset, Identity, User } from "../drizzle/schema";
  * db helper the merged authorizeTransfer path touches.
  */
 
+// AUDIT FIX regression: authorizeTransfer fails closed in MOCK mode, so the
+// ALLOW-path tests here present a real-chain adapter (BESU mode) via mocks.
+const chainMocks = vi.hoisted(() => ({
+  mode: "BESU" as "BESU" | "MOCK",
+  operatorAddress: "0xoperatorwallet" as string | null,
+}));
+vi.mock("./modules/blockchain/blockchain.service", () => ({
+  blockchainService: {
+    get mode() { return chainMocks.mode; },
+    get operatorAddress() { return chainMocks.operatorAddress; },
+    getNetworkStatus: vi.fn(async () => ({ connected: true, mode: chainMocks.mode, network: "test", latestBlock: 10 })),
+    getLatestBlock: vi.fn(async () => 10),
+    submitTransaction: vi.fn(async () => ({ transactionHash: "0xtest_tx", blockNumber: 11, status: "CONFIRMED" })),
+    getTransaction: vi.fn(),
+    getEvents: vi.fn(async () => []),
+  },
+  besuBlockchainService: null,
+}));
+vi.mock("./modules/blockchain/anchoring.service", () => ({
+  anchoringService: {
+    anchorIdentity: vi.fn(async () => ({ outcome: "SKIPPED", reason: "mock" })),
+    anchorAsset: vi.fn(async () => ({ outcome: "SKIPPED", reason: "mock" })),
+  },
+  deriveIdentityWallet: vi.fn(() => "0xderivedwallet"),
+}));
+
 vi.mock("./db", async (importOriginal: () => Promise<unknown>) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
   return {

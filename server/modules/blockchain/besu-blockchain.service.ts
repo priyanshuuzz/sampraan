@@ -97,14 +97,49 @@ export class BesuBlockchainService {
   }
 
   /**
-   * Run `task` so that at most ONE signed submit→receipt cycle is in flight
+   * Run `task` so that at most ONE signed submit-to-receipt cycle is in flight
    * for the shared operator key at any time. Failures do not poison the
    * chain: the next caller starts a fresh link.
+   *
+   * AUDIT FIX (BUG-036 hardening): each cycle starts with a nonce reset so the
+   * send reads a FRESH pending count from the chain instead of a cache that
+   * may predate pool events (dropped txs, a second process sharing the
+   * operator key). A send rejected with a nonce error (the tx provably never
+   * entered the pool) is retried exactly once against the refreshed count,
+   * self-healing instead of failing the user operation.
    */
   enqueueSubmit<T>(task: () => Promise<T>): Promise<T> {
-    const run = this.submitMutex.then(task, task);
+    const attempt = async (): Promise<T> => {
+      this.signer?.reset();
+      try {
+        return await task();
+      } catch (error) {
+        if (BesuBlockchainService.isNonceError(error)) {
+          this.signer?.reset();
+          return await task();
+        }
+        throw error;
+      }
+    };
+    const run = this.submitMutex.then(attempt, attempt);
     this.submitMutex = run.catch(() => undefined);
     return run;
+  }
+
+  /**
+   * A send-time nonce rejection: the transaction never entered the pool, so
+   * retrying after a nonce refresh cannot double-submit. Matches the ethers
+   * error code plus the raw Besu/Geth messages that arrive wrapped differently.
+   */
+  private static isNonceError(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const code = (error as { code?: unknown }).code;
+    if (code === "NONCE_EXPIRED" || code === "NONCE_COLLISION" || code === -32001) return true;
+    const message =
+      typeof (error as { message?: unknown }).message === "string"
+        ? (error as { message: string }).message.toLowerCase()
+        : "";
+    return /nonce (has already been used|too low)|already known|replacement transaction/.test(message);
   }
 
   /**

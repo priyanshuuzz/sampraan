@@ -211,10 +211,25 @@ export class GraphQueryService {
       if (registered.length === 0) return { identity: null, events: [] };
       const reg = registered[registered.length - 1] as EventLog;
       const args = reg.args as unknown as Record<string, unknown>;
+      // AUDIT FIX (live identity status): the status was hardcoded to 1
+      // (ACTIVE) and only corrected when an IdentityStatusChanged event
+      // happened to fall inside the scan window — an identity suspended or
+      // revoked BEFORE the window silently displayed ACTIVE. Read the
+      // CURRENT status from the registry's own view call instead; events
+      // remain the provenance trail, not the state source.
+      let status = 1;
+      try {
+        const record = await this.identityRegistry.getIdentity(wallet);
+        status = Number(record.status);
+      } catch {
+        // View call failed (RPC hiccup): fall back to the last in-window
+        // event status, or ACTIVE when none — never fabricated, just the
+        // best available evidence for an advisory query layer.
+      }
       const identity: GraphIdentity = {
         wallet,
         didDigest: String(args.didDigest),
-        status: 1,
+        status,
         registeredAt: Number(args.registeredAt),
         lastChangedAt: Number(args.registeredAt),
         blockNumber: reg.blockNumber,

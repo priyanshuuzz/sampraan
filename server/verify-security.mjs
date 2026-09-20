@@ -4,7 +4,7 @@
  * one challenge, consumes it with a deliberately-wrong signature, runs
  * simulator dry-runs, and reads provenance/graph. No chain state is mutated.
  */
-const API = process.env.SAMPPRAAN_API ?? "http://localhost:3000/api/trpc";
+const API = process.env.SAMPRAAN_API ?? "http://localhost:3000/api/trpc";
 let failures = 0;
 function check(label, ok, detail = "") {
   failures += ok ? 0 : 1;

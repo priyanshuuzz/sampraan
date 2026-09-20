@@ -38,7 +38,7 @@ const blockchainMocks = vi.hoisted(() => ({
   getTransaction: vi.fn(),
   getEvents: vi.fn(),
   operatorAddress: null as string | null,
-  mode: "MOCK" as const,
+  mode: "MOCK" as "BESU" | "MOCK",
   besu: null as null | {
     operatorAddress: string;
     registerIdentity: ReturnType<typeof vi.fn>;
@@ -55,8 +55,8 @@ vi.mock("./modules/blockchain/blockchain.service", () => ({
     submitTransaction: blockchainMocks.submitTransaction,
     getTransaction: blockchainMocks.getTransaction,
     getEvents: blockchainMocks.getEvents,
-    operatorAddress: blockchainMocks.operatorAddress,
-    mode: blockchainMocks.mode,
+    get operatorAddress() { return blockchainMocks.operatorAddress; },
+    get mode() { return blockchainMocks.mode; },
   },
   besuBlockchainService: blockchainMocks.besu,
 }));
@@ -522,6 +522,12 @@ describe("assets.authorizeTransfer", () => {
   });
 
   it("allows an admin transferring a controlled asset and submits the transaction", async () => {
+    // AUDIT FIX regression: MOCK mode now fails closed, so the successful
+    // submission path requires the adapter to present BESU mode.
+    const previousMode = blockchainMocks.mode;
+    blockchainMocks.mode = "BESU";
+    blockchainMocks.operatorAddress = "0xoperatorwallet";
+    try {
     dbMocks.getAssetById.mockResolvedValue({
       ...assetFixture,
       classification: "CONTROLLED",
@@ -560,10 +566,14 @@ describe("assets.authorizeTransfer", () => {
       action: "ASSET_TRANSFER",
       payload: {
         assetId: "ASSET-001",
-        toCustodianWallet: null,
+        toCustodianWallet: "0xoperatorwallet",
         actor: "admin-user",
       },
     });
+    } finally {
+      blockchainMocks.mode = previousMode;
+      blockchainMocks.operatorAddress = null;
+    }
   });
 
   it("denies a regular user transferring a controlled asset without a linked identity", async () => {

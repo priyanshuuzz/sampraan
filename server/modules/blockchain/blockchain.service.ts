@@ -35,9 +35,21 @@ export type BlockchainServiceLike = {
 
 const config = resolveBlockchainConfig();
 
+// AUDIT FIX (BUG-036 — duplicate operator signers): the Besu adapter is now
+// instantiated EXACTLY ONCE and the facade delegates to it. Previously BOTH
+// `blockchainService` (legacy facade — transfers) and `besuBlockchainService`
+// (typed adapter — mint/assign/anchor) constructed their OWN adapter with its
+// own NonceManager and submitMutex over the SAME operator key. Two concurrent
+// nonce allocators then handed the SAME account nonce to two transactions;
+// the first mined, the second was rejected by the pool with "Nonce too low"
+// — an intermittent mint/assign/transfer failure reproduced live by the
+// acceptance suite.
+export const besuBlockchainService: BesuBlockchainService | null =
+  config.mode === "BESU" ? new BesuBlockchainService(config) : null;
+
 function createService(): BlockchainServiceLike {
-  if (config.mode === "BESU") {
-    const besu = new BesuBlockchainService(config);
+  if (besuBlockchainService) {
+    const besu = besuBlockchainService;
     const operatorAddress = (() => {
       try {
         return besu.operatorAddress;
@@ -70,11 +82,8 @@ function createService(): BlockchainServiceLike {
 }
 
 export const blockchainService: BlockchainServiceLike = createService();
-
-// Full typed surface for callers that specifically want the Besu adapter
-// (identity/asset operations beyond the legacy facade).
-export const besuBlockchainService: BesuBlockchainService | null =
-  config.mode === "BESU" ? new BesuBlockchainService(config) : null;
+// (The typed surface above now shares the SINGLE adapter instance created at
+// the top of this module — there is exactly one NonceManager per process.)
 
 export type {
   BlockchainOperationInput,

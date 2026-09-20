@@ -52,7 +52,7 @@ const blockchainMocks = vi.hoisted(() => ({
   getTransaction: vi.fn(),
   getEvents: vi.fn(),
   operatorAddress: null as string | null,
-  mode: "MOCK" as const,
+  mode: "MOCK" as "BESU" | "MOCK",
 }));
 
 // Stable besu service object: property reads happen at call time, so per-test
@@ -88,7 +88,7 @@ vi.mock("./modules/blockchain/blockchain.service", () => ({
     getTransaction: blockchainMocks.getTransaction,
     getEvents: blockchainMocks.getEvents,
     operatorAddress: blockchainMocks.operatorAddress,
-    mode: blockchainMocks.mode,
+    get mode() { return blockchainMocks.mode; },
   },
   besuBlockchainService: besuMocks,
 }));
@@ -592,10 +592,12 @@ describe("assets.authorizeTransfer with recipient selection", () => {
       permissions: ["asset:read", "asset:transfer"],
     });
     dbMocks.getIdentityById.mockResolvedValue(recipientIdentity);
-    // Real-chain binding for the recipient path: operator key set, and the
-    // on-chain custodian differs from the recipient's derived wallet so the
+    // Real-chain binding for the recipient path: operator key set, adapter in
+    // BESU mode (AUDIT FIX: MOCK mode now fails closed before submission), and
+    // the on-chain custodian differs from the recipient's derived wallet so the
     // transfer actually submits.
     besuMocks.config.privateKey = "0xtest-operator-key";
+    blockchainMocks.mode = "BESU";
     besuMocks.getAsset.mockResolvedValue({ custodian: "0xsomeothercustodian" });
     blockchainMocks.submitTransaction.mockResolvedValue({
       transactionHash: "0xrecipient_tx",

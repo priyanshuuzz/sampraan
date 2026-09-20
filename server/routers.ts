@@ -58,6 +58,7 @@ import { buildAssetProvenance } from "./modules/provenance/provenance.service";
 import { graphQueryService } from "./modules/graph/graph.service";
 import { isDuplicateEntryError } from "./modules/db/db-errors";
 import { describeError } from "./common/error-handler";
+import { isLoginThrottled, recordLoginFailure, clearLoginFailures } from "./common/login-throttle";
 import { verifyPassword } from "./auth/password";
 import {
   recordIntelligenceScanEvidence,
@@ -142,8 +143,17 @@ export const appRouter = router({
         await createAuditEvent({ actorIdentityId: result.identityId, action: "DID_AUTH_SUCCEEDED", resourceType: "IDENTITY", resourceId: result.did, decision: "ALLOW", reason: "Challenge signature verified against the DID reference wallet", metadata: { source: "did-auth", recoveredAddress: result.recoveredAddress, sessionIssued: Boolean(sessionToken) } }).catch(() => undefined);
         return { ok: true as const, identityId: result.identityId, did: result.did, displayName: identity?.displayName ?? null, identityStatus: identity?.status ?? null, sessionToken };
       }),
-    /** Key lifecycle read model. */
-    keyStatus: protectedProcedure.input(z.object({ did: z.string().min(8).max(255) })).query(async ({ input }) => {
+    /**
+     * Key lifecycle read model. Scoped: only the DID's own linked identity
+     * (or a platform administrator) may read a key's lifecycle state —
+     * arbitrary enumeration of other identities' key material state is not
+     * permitted.
+     */
+    keyStatus: protectedProcedure.input(z.object({ did: z.string().min(8).max(255) })).query(async ({ input, ctx }) => {
+      const actor = await getIdentityByLinkedUserId(ctx.user.id);
+      if (actor?.did !== input.did.trim() && ctx.user.role !== "admin") {
+        throw new TRPCError({ code: "FORBIDDEN", message: "You may only read the key status of your own DID" });
+      }
       const db = await import("./db").then(m => m.getDb());
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
       const { didRecords } = await import("../drizzle/schema");
@@ -152,11 +162,22 @@ export const appRouter = router({
       if (!rows[0]) throw new TRPCError({ code: "NOT_FOUND", message: "DID not found" });
       return rows[0];
     }),
-    /** Rotate the current key: the old key immediately stops authenticating. */
+    /**
+     * Rotate the current key: the old key immediately stops authenticating.
+     * SECURITY (audit fix — IDOR): rotation is SELF-SERVICE for the DID's own
+     * linked identity. Previously ANY authenticated session could rotate ANY
+     * DID's key by name, letting one user lock another identity out of DID
+     * authentication. Platform administrators may still rotate any DID.
+     */
     rotateKey: protectedProcedure.input(z.object({ did: z.string().min(8).max(255) })).mutation(async ({ input, ctx }) => {
+      const actor = await getIdentityByLinkedUserId(ctx.user.id);
+      if (actor?.did !== input.did.trim() && ctx.user.role !== "admin") {
+        await createAuditEvent({ actorIdentityId: actor?.id ?? null, action: "DID_KEY_ROTATION_DENIED", resourceType: "IDENTITY", resourceId: input.did, decision: "DENY", reason: "Only the DID's own identity or an administrator may rotate the key", metadata: { source: "did-lifecycle" } }).catch(() => undefined);
+        scheduleIntelligenceScan();
+        throw new TRPCError({ code: "FORBIDDEN", message: "You may only rotate the key of your own DID" });
+      }
       const result = await rotateDidKey(input.did);
       if (!result.ok) throw new TRPCError({ code: "BAD_REQUEST", message: result.reason });
-      const actor = await getIdentityByLinkedUserId(ctx.user.id);
       await createAuditEvent({ actorIdentityId: actor?.id ?? null, action: "DID_KEY_ROTATED", resourceType: "IDENTITY", resourceId: input.did, decision: "ALLOW", reason: "Key marked ROTATED — previous key cannot authenticate", metadata: { source: "did-lifecycle" } }).catch(() => undefined);
       return result;
     }),
@@ -247,6 +268,26 @@ export const appRouter = router({
         }),
       )
       .mutation(async ({ input, ctx }) => {
+        // SECURITY (audit fix — brute-force throttle): per-account failure
+        // limiting for the local password path. 5 failures / 15 min => 429.
+        // Success clears the counter. The limiter is advisory to the auth
+        // decision (it never AUTHENTICATES anything); it only slows guessing.
+        const throttle = isLoginThrottled(input.email);
+        if (throttle) {
+          await createAuditEvent({
+            actorIdentityId: null,
+            action: "LOGIN_THROTTLED",
+            resourceType: "SESSION",
+            resourceId: input.email.replace(/(.{2}).*(@.*)/, "$1***$2"),
+            decision: "DENY",
+            reason: "Too many failed login attempts",
+            metadata: { source: "local-auth", retryAfterMs: throttle.retryAfterMs },
+          }).catch(() => undefined);
+          throw new TRPCError({
+            code: "TOO_MANY_REQUESTS",
+            message: `Too many failed login attempts. Try again in ${Math.ceil(throttle.retryAfterMs / 60000)} minutes.`,
+          });
+        }
         const { burnPasswordTiming } = await import("./auth/password");
         const user = await getUserByEmail(input.email).catch(() => undefined);
         let authenticated = false;
@@ -256,6 +297,7 @@ export const appRouter = router({
           await burnPasswordTiming();
         }
         if (!user || !authenticated) {
+          recordLoginFailure(input.email);
           await createAuditEvent({
             actorIdentityId: null,
             action: "LOGIN_FAILED",
@@ -269,6 +311,8 @@ export const appRouter = router({
           throw new TRPCError({ code: "UNAUTHORIZED", message: "Invalid email or password" });
         }
 
+        // Successful authentication clears this account's failure counter.
+        clearLoginFailures(input.email);
         const sessionToken = await sdk.createSessionToken(user.openId, {
           name: user.name ?? "",
           expiresInMs: SESSION_TTL_MS,
@@ -833,7 +877,27 @@ export const appRouter = router({
         // attribution (never the resource owner) before returning.
         await createAuditEvent({ actorIdentityId: actorIdentity?.id ?? null, action: "AUTHORIZATION_DENIED", resourceType: "ASSET", resourceId: asset.assetId, decision: "DENY", reason, metadata: { source: "authorization-engine", policyId: null, actorOpenId: ctx.user.openId, actorUserRole: ctx.user.role, actorUserOpenId: ctx.user.openId, ownerStatus } });
         return { ...decision, transaction: null };
-      }      // ABAC CONTEXT (server-resolved only, LOOP 4/5/6):
+      }
+      // SECURITY (audit fix — recipient status): a NAMED recipient is resolved
+      // from the database like every other authorization input; its lifecycle
+      // status must be ACTIVE before any policy evaluation. A suspended or
+      // revoked recipient previously flowed through to the chain (which the
+      // contract then reverts with RecipientNotActive) — fail closed HERE with
+      // an audited DENY instead of relying on the on-chain revert alone.
+      if (input.recipientIdentityId && recipient && recipient.status !== "ACTIVE") {
+        const reason = `Recipient identity is ${recipient.status.toLowerCase()}`;
+        const decision = {
+          decision: "DENY" as const,
+          decisionId: crypto.randomUUID(),
+          reason,
+          policyId: undefined,
+          timestamp: new Date().toISOString(),
+        };
+        await createAuditEvent({ actorIdentityId: actorIdentity?.id ?? null, action: "AUTHORIZATION_DENIED", resourceType: "ASSET", resourceId: asset.assetId, decision: "DENY", reason, metadata: { source: "authorization-engine", policyId: null, actorOpenId: ctx.user.openId, actorUserRole: ctx.user.role, actorUserOpenId: ctx.user.openId, recipientStatus: recipient.status } });
+        scheduleIntelligenceScan();
+        return { ...decision, transaction: null };
+      }
+      // ABAC CONTEXT (server-resolved only, LOOP 4/5/6):
       //  - custody: current custodian identity from the DATABASE read model
       //  - step-up: a server-verified step-up session for this exact asset
       //  - approval: the requester's active approval row for this operation
@@ -847,6 +911,16 @@ export const appRouter = router({
         securityIntelligenceService.assessRisk({ identityId: actorIdentity?.id ?? null, action: "TRANSFER", classification: asset.classification }),
       ]);
       const sensitive = asset.classification === "HIGHLY_SENSITIVE" || asset.classification === "CRITICAL";
+      // SECURITY (audit fix — approval→target binding): an approval authorizes
+      // the request it was granted FOR. asset_approvals.targetIdentityId is
+      // the intended recipient recorded at request time; a transfer naming a
+      // DIFFERENT recipient is a CHANGED request and must never consume that
+      // approval — it falls back through the approval gate (CHALLENGE) and
+      // the requester must obtain a fresh approval for the new recipient.
+      const approvalMatchesTarget =
+        !approvalRow ||
+        approvalRow.targetIdentityId == null ||
+        (recipient !== null && approvalRow.targetIdentityId === recipient.id);
       const result = authorizationService.evaluate({
         identityStatus: actorIdentity?.status ?? "UNREGISTERED",
         // Platform admin maps to the ADMIN role and gains administration:manage;
@@ -861,7 +935,7 @@ export const appRouter = router({
         assetClassification: asset.classification,
         actorIdentityId: actorIdentity?.id,
         currentCustodianIdentityId: asset.custodianIdentityId,
-        approvalStatus: approvalRow?.status,
+        approvalStatus: approvalMatchesTarget ? approvalRow?.status : undefined,
         riskLevel,
         context: {
           stepUpAuthenticated: stepUpValid,
@@ -921,6 +995,29 @@ export const appRouter = router({
         // Denied/challenged requests feed the advisory intelligence engine.
         scheduleIntelligenceScan();
         return { ...result, transaction: null };
+      }
+
+      // SECURITY (audit fix — no fabricated evidence): a transfer may ONLY be
+      // submitted against a REAL Besu binding. When the chain is not
+      // configured (MOCK mode) there is nothing to confirm against; the mock
+      // adapter fabricates "CONFIRMED" hashes (0xmock_*), so submitting there
+      // would write ASSET_TRANSFERRED evidence with a fake transaction hash
+      // and move read-model custody without any chain state change. Fail
+      // closed exactly like assets.assign does.
+      if (blockchainService.mode !== "BESU") {
+        const reason = "Blockchain is not configured (MOCK mode) — custody transfer cannot be executed on-chain";
+        await createAuditEvent({
+          actorIdentityId: actorIdentity?.id ?? null,
+          action: "BLOCKCHAIN_TRANSACTION_FAILED",
+          resourceType: "ASSET",
+          resourceId: asset.assetId,
+          decision: "DENY",
+          reason,
+          metadata: { source: "blockchain-evidence", chainMode: blockchainService.mode, ...actingUser },
+        }).catch((persistError: unknown) => {
+          console.error("[Authorization] Failed to persist chain-unavailable audit event:", persistError);
+        });
+        throw new TRPCError({ code: "PRECONDITION_FAILED", message: reason });
       }
 
       // Policy ALLOWed the request. The smart contract now INDEPENDENTLY

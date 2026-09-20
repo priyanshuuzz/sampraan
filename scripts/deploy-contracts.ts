@@ -13,7 +13,12 @@
  * genesis alloc account when absent — only on the local QBFT chain).
  *
  * Run: pnpm run blockchain:deploy
+ *
+ * AUDIT FIX: this script now loads .env (dotenv/config) so a configured
+ * BLOCKCHAIN_PRIVATE_KEY is actually honored — previously the operator key
+ * was silently ignored here and the demo genesis fallback was used instead.
  */
+import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";

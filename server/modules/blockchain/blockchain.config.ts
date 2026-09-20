@@ -49,7 +49,14 @@ function isConfigured(address: string | undefined | null): address is string {
 }
 
 function isPrivateKey(value: string | undefined | null): value is string {
-  return typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value);
+  if (!(typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value))) return false;
+  // AUDIT FIX (zero-key refusal): the all-zero key passes the hex shape but
+  // corresponds to no real account — treating it as "BESU ready" produced a
+  // signer that could never fund or send a transaction (and made the mode
+  // report healthy while every submission would revert). Degrade to MOCK so
+  // the status surfaces the real problem instead of failing mid-mint.
+  if (/^0x0{64}$/.test(value)) return false;
+  return true;
 }
 
 /**

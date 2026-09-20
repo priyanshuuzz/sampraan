@@ -13,6 +13,7 @@ import { blockchainService } from "../modules/blockchain/blockchain.service";
 import { chainEventIndexer } from "../modules/blockchain/chain-event-indexer";
 import { corsPolicy, rateLimit, requestLogger, securityHeaders } from "../common/security";
 import { safeErrorHandler } from "../common/error-handler";
+import { parseListenPort } from "../common/port";
 
 /**
  * BUG-004 (QA #2): the chain event indexer existed but was never invoked, so
@@ -136,7 +137,23 @@ async function startServer() {
     serveStatic(app);
   }
 
-  const preferredPort = parseInt(process.env.PORT || "3000");
+  // BUG-AUDIT-1: PORT=0 / garbage values previously produced an ephemeral or
+  // broken binding (observed live with an inherited PORT=0). Validate first:
+  // an explicitly-set but invalid PORT fails closed in production and falls
+  // back to 3000 with a loud warning in development.
+  const rawPort = process.env.PORT;
+  const configuredPort = parseListenPort(rawPort);
+  if (rawPort !== undefined && rawPort.trim() !== "" && configuredPort === null) {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error(
+        `[Production] PORT must be an integer between 1 and 65535 (received: "${rawPort}"). Refusing to start with an unusable port.`
+      );
+    }
+    console.warn(
+      `[Server] PORT "${rawPort}" is not a usable port (1-65535) — falling back to 3000.`
+    );
+  }
+  const preferredPort = configuredPort ?? 3000;
 
   // Production must bind the EXACT configured port: behind an orchestrator,
   // health checks and reverse proxies target a known port, so silently

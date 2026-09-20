@@ -45,6 +45,12 @@ export async function verifyPassword(password: string, stored: string | null | u
   const p = Number(pStr);
   if (!Number.isInteger(n) || !Number.isInteger(r) || !Number.isInteger(p)) return false;
   if (n < 1024 || n > 1_048_576 || r < 1 || r > 64 || p < 1 || p > 8) return false;
+  // AUDIT FIX (memory guard): the shape bounds alone allowed a hostile or
+  // corrupt stored row (n=2^20, r=64) to make the LOGIN path request
+  // 128*n*r ≈ 8 GB of scrypt memory — a denial-of-service via one DB write.
+  // Cap the memory parameter at the profile the hasher itself produces
+  // (N=2^15, r=8 → 32 MB; allow 128 MB headroom for legitimate upgrades).
+  if (n * r > 1_048_576) return false;
   try {
     const salt = Buffer.from(saltB64, "base64url");
     const expected = Buffer.from(hashB64, "base64url");

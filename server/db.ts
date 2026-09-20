@@ -1,4 +1,5 @@
-import { and, desc, eq, inArray, isNotNull, isNull, or } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, max, or } from "drizzle-orm";
+import { createHash } from "node:crypto";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
   assetApprovals,
@@ -570,6 +571,23 @@ export async function listIndexedChainEventKeys(): Promise<Set<string>> {
 }
 
 /**
+ * Durable indexer checkpoint: the highest block number already projected
+ * into the chain read model. The indexer resumes from here (+ re-scans that
+ * block; per-event dedup makes that free) so downtime LONGER than the scan
+ * window can no longer silently drop events — previously a restart more
+ * than 500 blocks after the last scan skipped everything in between.
+ */
+export async function getMaxIndexedChainBlock(): Promise<number | null> {
+  const db = await getDb();
+  if (!db) return null;
+  const rows = await db
+    .select({ maxBlock: max(auditEvents.blockNumber) })
+    .from(auditEvents)
+    .where(eq(auditEvents.source, "CHAIN_READ_MODEL"));
+  return rows[0]?.maxBlock ?? null;
+}
+
+/**
  * QA #5 (server-side session revocation): given a session token, classify
  * its server-side tracking state. DISTINCT outcomes matter:
  *  - "UNTRACKED"  — no row exists for this token (e.g. cron sessions,
@@ -596,13 +614,25 @@ export async function classifyPlatformSession(sessionToken: string): Promise<Pla
       revokedAt: sessions.revokedAt,
     })
     .from(sessions)
-    .where(eq(sessions.sessionId, sessionToken))
+    .where(eq(sessions.sessionId, hashSessionToken(sessionToken)))
     .limit(1);
   const row = rows[0];
   if (!row) return { state: "UNTRACKED" };
   if (row.revokedAt) return { state: "REVOKED" };
   if (row.expiresAt.getTime() <= Date.now()) return { state: "EXPIRED" };
   return { state: "ACTIVE", id: row.id, identityId: row.identityId, expiresAt: row.expiresAt };
+}
+
+/**
+ * SECURITY (audit fix — token-at-rest): session tracking rows must not store
+ * the raw bearer token. A read-only database leak (backup, log, support dump)
+ * previously yielded immediately usable session credentials. Only the SHA-256
+ * digest is persisted now; every classify/revoke/track call hashes its input,
+ * so callers keep passing the raw token and nothing else changes.
+ * Revocation lookup is by digest, which is exactly as unique as the token.
+ */
+export function hashSessionToken(sessionToken: string): string {
+  return createHash("sha256").update(sessionToken, "utf8").digest("hex");
 }
 
 /**
@@ -615,7 +645,7 @@ export async function revokePlatformSession(sessionToken: string): Promise<boole
   const result = await db
     .update(sessions)
     .set({ revokedAt: new Date() })
-    .where(and(eq(sessions.sessionId, sessionToken), isNull(sessions.revokedAt)));
+    .where(and(eq(sessions.sessionId, hashSessionToken(sessionToken)), isNull(sessions.revokedAt)));
   return (result as unknown as { affectedRows?: number }).affectedRows !== 0;
 }
 
@@ -694,7 +724,7 @@ export async function trackPlatformSession(input: {
       .values({
         id: crypto.randomUUID(),
         identityId,
-        sessionId: input.sessionToken,
+        sessionId: hashSessionToken(input.sessionToken),
         expiresAt: input.expiresAt,
       })
       .onDuplicateKeyUpdate({

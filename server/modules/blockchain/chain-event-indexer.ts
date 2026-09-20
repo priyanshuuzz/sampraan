@@ -10,7 +10,7 @@
  * has already indexed (idempotent by transaction hash).
  */
 import { describeError } from "../../common/error-handler";
-import { createAuditEvent, listIndexedChainEventKeys, listIndexedChainTxHashes } from "../../db";
+import { createAuditEvent, getMaxIndexedChainBlock, listIndexedChainEventKeys, listIndexedChainTxHashes } from "../../db";
 import { besuBlockchainService } from "./blockchain.service";
 import type { ChainEvent } from "./blockchain.types";
 
@@ -74,7 +74,19 @@ export class ChainEventIndexer {
     }
 
     const latestBlock = status.latestBlock;
-    const fromBlock = Math.max(0, latestBlock - windowBlocks);
+    // RESTART-SAFETY (audit fix): resume from the durable checkpoint (the
+    // highest block already projected) instead of a fixed lookback window.
+    // Downtime longer than `windowBlocks` used to skip every block in
+    // between. The window floor still bounds the query when no checkpoint
+    // exists (fresh DB), and the result is clamped to head so a checkpoint
+    // ahead of the chain (e.g. DB restore against a rewound chain) cannot
+    // produce an inverted range.
+    const checkpoint = await getMaxIndexedChainBlock().catch(() => null);
+    const windowFloor = Math.max(0, latestBlock - windowBlocks);
+    const fromBlock =
+      checkpoint != null
+        ? Math.min(Math.max(windowFloor, checkpoint), latestBlock)
+        : windowFloor;
 
     // BUG-030: the in-memory dedup set alone loses its state on every
     // process restart, and each restart then re-projects the whole recent

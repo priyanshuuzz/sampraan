@@ -7,7 +7,7 @@
  * It is not imported by the application and never runs in production paths.
  */
 import "dotenv/config";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { SignJWT } from "jose";
 import mysql from "mysql2/promise";
 import process from "node:process";
@@ -51,11 +51,12 @@ const token = await new SignJWT({ openId, appId, name: "SAMPRAAN Demo Admin" })
   .sign(key);
 
 // Track the issued platform session so server-side revocation has a row to
-// revoke (sessions.sessionId mirrors the issued token).
+// revoke. SECURITY: sessions.sessionId stores the SHA-256 digest of the token
+// (matching db.ts hashSessionToken) — never the raw bearer token.
 await conn.execute(
   "INSERT INTO sessions (id, identityId, sessionId, expiresAt) VALUES (?, ?, ?, ?) " +
     "ON DUPLICATE KEY UPDATE expiresAt = VALUES(expiresAt), revokedAt = NULL",
-  [randomUUID(), identityId, token, new Date(Date.now() + 7 * 24 * 3600 * 1000)]
+  [randomUUID(), identityId, createHash("sha256").update(token, "utf8").digest("hex"), new Date(Date.now() + 7 * 24 * 3600 * 1000)]
 );
 
 console.log(JSON.stringify({ openId, identityId, token }, null, 2));

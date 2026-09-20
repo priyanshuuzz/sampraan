@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TrpcContext } from "./_core/context";
 import type { User } from "../drizzle/schema";
 
@@ -42,7 +42,7 @@ const blockchainMocks = vi.hoisted(() => ({
   getTransaction: vi.fn(),
   getEvents: vi.fn(),
   operatorAddress: "0xOperatorWallet" as string | null,
-  mode: "MOCK" as const,
+  mode: "MOCK" as "BESU" | "MOCK",
   besu: null as null | Record<string, unknown>,
 }));
 
@@ -60,7 +60,7 @@ vi.mock("./modules/blockchain/blockchain.service", () => ({
     getTransaction: blockchainMocks.getTransaction,
     getEvents: blockchainMocks.getEvents,
     operatorAddress: blockchainMocks.operatorAddress,
-    mode: blockchainMocks.mode,
+    get mode() { return blockchainMocks.mode; },
   },
   besuBlockchainService: blockchainMocks.besu,
 }));
@@ -188,6 +188,18 @@ describe("BUG-003: creation anchors on-chain", () => {
 });
 
 describe("BUG-006: confirmed transfer syncs the read model", () => {
+  // AUDIT FIX regression: authorizeTransfer now fails closed unless the
+  // blockchain adapter is REALLY configured (mode === "BESU"); the mock
+  // service must therefore present BESU mode for the ALLOW→submit→sync path.
+  let previousMode: "BESU" | "MOCK";
+  beforeEach(() => {
+    previousMode = blockchainMocks.mode;
+    blockchainMocks.mode = "BESU";
+  });
+  afterEach(() => {
+    blockchainMocks.mode = previousMode;
+  });
+
   const activeAsset = {
     id: "00000000-0000-4000-8000-0000000000f1",
     assetId: "ASSET-REG-001",

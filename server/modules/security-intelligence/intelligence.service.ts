@@ -14,6 +14,11 @@
  *  R2 REVOKED_IDENTITY_ACTIVITY — audit rows referencing a REVOKED identity.
  *  R3 CHAIN_FAILURES — BLOCKCHAIN_TRANSACTION_FAILED / BLOCKCHAIN_ANCHOR_FAILED
  *     events (operational risk signal).
+ *  R4 SENSITIVE_ATTEMPTS — repeated step-up CHALLENGE decisions (probing).
+ *  R5 STEP_UP_FAILURES — failed server-verified step-up proofs.
+ *  R6 TRANSFER_BURST — abnormal on-chain custody transfer frequency.
+ *  R7 LOGIN_FAILURES — repeated LOGIN_FAILED / LOGIN_THROTTLED events
+ *     (brute-force signal from the local authentication path).
  */
 import { createAuditEvent, createSecurityAlert, listAuditEvents, listIdentities } from "../../db";
 import type { AuditEvent, Identity } from "../../../drizzle/schema";
@@ -228,6 +233,29 @@ export class SecurityIntelligenceService {
         riskScore: Math.min(85, 40 + count * 4),
       });
       if (result === "created") { created++; firedRules.push({ rule: "R6-TRANSFER-BURST", identityId, count }); }
+      else suppressed++;
+    }
+
+    // R7: repeated failed logins — brute-force/password-spray signal from the
+    // local authentication path (LOGIN_FAILED / LOGIN_THROTTLED audit rows;
+    // actorIdentityId is null because the actor is not yet authenticated, so
+    // the alert is system-scoped and keyed by the masked account in the trail).
+    const loginFailures = events.filter(
+      event => event.action === "LOGIN_FAILED" || event.action === "LOGIN_THROTTLED"
+    );
+    if (loginFailures.length >= 5) {
+      const key = alertKey("R7-LOGIN-FAILURES", null, day);
+      const result = await this.upsertAlert({
+        key,
+        title: `Repeated login failures (${loginFailures.length})`,
+        severity: loginFailures.length >= 10 ? "HIGH" : "MEDIUM",
+        status: "OPEN",
+        identityId: null,
+        assetId: null,
+        description: `Advisory rule R7: ${loginFailures.length} failed/throttled login attempt(s) in the recent audit window — possible credential guessing against local accounts. Per-account throttling is enforced by the login path; this signal is for investigators.`,
+        riskScore: loginFailures.length >= 10 ? 70 : 50,
+      });
+      if (result === "created") { created++; firedRules.push({ rule: "R7-LOGIN-FAILURES", identityId: null, count: loginFailures.length }); }
       else suppressed++;
     }
 
