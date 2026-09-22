@@ -55,10 +55,15 @@ vi.mock("./db", async (importOriginal: () => Promise<unknown>) => {
     getIdentityRolesAndPermissions: vi.fn(),
     createAuthorizationDecision: vi.fn(async (input: unknown) => input),
     createAuditEvent: vi.fn(async (input: unknown) => input),
+    applyIdentityStatusChange: vi.fn(async (input: { identityId: string; status: string }) => ({
+      ...activeIdentity,
+      status: input.status,
+    })),
   };
 });
 
 import {
+  applyIdentityStatusChange,
   createAuditEvent,
   createAuthorizationDecision,
   getAssetById,
@@ -73,6 +78,7 @@ const mockedGetIdentityByLinkedUserId = vi.mocked(getIdentityByLinkedUserId);
 const mockedGetRolesAndPermissions = vi.mocked(getIdentityRolesAndPermissions);
 const mockedCreateAuditEvent = vi.mocked(createAuditEvent);
 const mockedCreateDecision = vi.mocked(createAuthorizationDecision);
+const mockedApplyStatus = vi.mocked(applyIdentityStatusChange);
 
 function makeUser(overrides: Partial<User> = {}): User {
   return {
@@ -536,6 +542,76 @@ describe("assets.authorizeTransfer — client input cannot bypass policy", () =>
     expect(result.policyId).toBe("POLICY-STEP-UP");
     expect(result.transaction).toBeNull();
     expectAuditActorRecorded();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Suite 2b: identities.setStatus self-lockout guard (admin regression).
+// Observed incident: an administrator invoked "Suspend" on their OWN identity
+// card. applyIdentityStatusChange downgraded the linked identity to
+// SUSPENDED, and sdk.authenticateRequest's fail-closed gate then rejected the
+// admin's own session — the last ACTIVE administrator was locked out of the
+// system. The guard refuses any ACTIVE -> SUSPENDED/REVOKED transition on the
+// identity bound to the acting session (reactivation of a lower status is
+// always permitted) and persists the refusal as audit evidence.
+// ---------------------------------------------------------------------------
+describe("identities.setStatus — self-lockout guard", () => {
+  const adminUser = makeUser({ id: 2, openId: "admin-open-2", role: "admin" });
+  const adminIdentity = { ...activeIdentity, id: "0e0d3b1a-9999-4ccc-8ddd-444455551111", linkedUserId: 2 };
+
+  it("FORBIDS an admin suspending their OWN identity (no status change, audit evidence written)", async () => {
+    mockedGetIdentityByLinkedUserId.mockResolvedValue(adminIdentity);
+    mockedGetIdentityById.mockResolvedValue(adminIdentity);
+
+    const caller = appRouter.createCaller(makeContext(adminUser));
+    await expect(
+      caller.identities.setStatus({ identityId: adminIdentity.id, status: "SUSPENDED" })
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+    // The read model must NOT be mutated and nothing may be anchored.
+    expect(mockedApplyStatus).not.toHaveBeenCalled();
+    // The denial is evidence, attributed to the acting identity.
+    expect(mockedCreateAuditEvent).toHaveBeenCalledTimes(1);
+    const auditCall = mockedCreateAuditEvent.mock.calls[0][0];
+    expect(auditCall.action).toBe("AUTHORIZATION_DENIED");
+    expect(auditCall.decision).toBe("DENY");
+    expect(auditCall.actorIdentityId).toBe(adminIdentity.id);
+    expect(auditCall.metadata).toMatchObject({ requestedStatus: "SUSPENDED", actorUserRole: "admin" });
+  });
+
+  it("FORBIDS an admin revoking their OWN identity", async () => {
+    mockedGetIdentityByLinkedUserId.mockResolvedValue(adminIdentity);
+    mockedGetIdentityById.mockResolvedValue(adminIdentity);
+
+    const caller = appRouter.createCaller(makeContext(adminUser));
+    await expect(
+      caller.identities.setStatus({ identityId: adminIdentity.id, status: "REVOKED" })
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(mockedApplyStatus).not.toHaveBeenCalled();
+  });
+
+  it("ALLOWS an admin suspending a DIFFERENT identity (legitimate administration)", async () => {
+    mockedGetIdentityByLinkedUserId.mockResolvedValue(adminIdentity);
+    const otherIdentity = { ...activeIdentity, id: "0e0d3b1a-7777-4aaa-8eee-444455552222", linkedUserId: 3 };
+    mockedGetIdentityById.mockResolvedValue(otherIdentity);
+
+    const caller = appRouter.createCaller(makeContext(adminUser));
+    const result = await caller.identities.setStatus({ identityId: otherIdentity.id, status: "SUSPENDED" });
+
+    expect(result.changed).toBe(true);
+    expect(mockedApplyStatus).toHaveBeenCalledTimes(1);
+    expect(mockedApplyStatus.mock.calls[0][0]).toMatchObject({ identityId: otherIdentity.id, status: "SUSPENDED" });
+  });
+
+  it("ALLOWS an admin REACTIVATING their own suspended identity (recovery path)", async () => {
+    mockedGetIdentityByLinkedUserId.mockResolvedValue({ ...adminIdentity, status: "SUSPENDED" });
+    mockedGetIdentityById.mockResolvedValue({ ...adminIdentity, status: "SUSPENDED" });
+
+    const caller = appRouter.createCaller(makeContext(adminUser));
+    const result = await caller.identities.setStatus({ identityId: adminIdentity.id, status: "ACTIVE" });
+
+    expect(result.changed).toBe(true);
+    expect(mockedApplyStatus).toHaveBeenCalledWith(expect.objectContaining({ identityId: adminIdentity.id, status: "ACTIVE" }));
   });
 });
 

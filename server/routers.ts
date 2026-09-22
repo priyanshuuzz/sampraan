@@ -516,6 +516,30 @@ export const appRouter = router({
       if (identity.status === input.status) {
         return { ...identity, changed: false as const };
       }
+      // SECURITY (self-lockout guard): an administrator can never downgrade
+      // the lifecycle status of the identity bound to their own session.
+      // Suspending/revoking your own identity strips every platform
+      // privilege from your session (sdk.authenticateRequest fails closed),
+      // instantly locking the last ACTIVE administrator out of the system —
+      // observed in the wild when the UI "Suspend" action was invoked on
+      // the acting admin's own identity card. Re-activation RECOVERY of a
+      // lower status is always allowed; only the ACTIVE -> SUSPENDED/REVOKED
+      // self-transition is refused. The denial is persisted as audit
+      // evidence like every other authorization decision.
+      const actingIdentity = ctx.user ? await getIdentityByLinkedUserId(ctx.user.id).catch(() => undefined) : undefined;
+      if (actingIdentity && actingIdentity.id === input.identityId && input.status !== "ACTIVE") {
+        const reason = `Self-lockout prevention: an administrator cannot set their own identity to ${input.status}`;
+        await createAuditEvent({
+          actorIdentityId: actingIdentity.id,
+          action: "AUTHORIZATION_DENIED",
+          resourceType: "IDENTITY",
+          resourceId: input.identityId,
+          decision: "DENY",
+          reason,
+          metadata: { source: "identity-administration", requestedStatus: input.status, actorUserRole: ctx.user.role, actorUserOpenId: ctx.user.openId },
+        }).catch(() => undefined);
+        throw new TRPCError({ code: "FORBIDDEN", message: reason });
+      }
       const updated = await applyIdentityStatusChange({
         identityId: input.identityId,
         status: input.status,
