@@ -149,6 +149,13 @@ export function identityMap(identities: Identity[] | undefined | null): Map<stri
   return map;
 }
 
+/** Mid-truncate a long technical value (tx hash, policy id) keeping both ends. */
+export function truncateMid(value: string | null | undefined, keep = 8): string {
+  if (!value) return "—";
+  if (value.length <= keep * 2 + 1) return value;
+  return `${value.slice(0, keep)}…${value.slice(-keep)}`;
+}
+
 export interface AuditDisplayRow {
   key: string;
   time: string;
@@ -160,6 +167,10 @@ export interface AuditDisplayRow {
   decision: string;
   decisionTone: Tone;
   tx: string;
+  reason: string | null;
+  txHash: string | null;
+  block: number | null;
+  source: string | null;
 }
 
 /** Normalize audit events into the workspace table contract. */
@@ -178,6 +189,10 @@ export function toAuditRows(events: AuditEvent[] | undefined | null, identities:
       decision: decisionLabel(event.decision),
       decisionTone: decisionTone(event.decision),
       tx: formatTxHash(event),
+      reason: event.reason ?? null,
+      txHash: event.transactionHash ?? null,
+      block: event.blockNumber ?? null,
+      source: event.source ?? null,
     };
   });
 }
@@ -187,10 +202,15 @@ export interface DecisionDisplayRow {
   key: string;
   time: string;
   did: string;
+  fullDid: string | null;
+  actorName: string;
   action: string;
   asset: string;
   decision: string;
   tone: Tone;
+  reason: string | null;
+  txHash: string | null;
+  block: number | null;
 }
 
 export function toDecisionRows(events: AuditEvent[] | undefined | null, identities: Identity[] | undefined | null, limit = 4): DecisionDisplayRow[] {
@@ -204,10 +224,15 @@ export function toDecisionRows(events: AuditEvent[] | undefined | null, identiti
         key: event.id ?? `${index}`,
         time: formatClock(event.timestamp),
         did: actor ? shortDid(actor.did) : "did:—",
+        fullDid: actor?.did ?? null,
+        actorName: actor?.displayName ?? "Unattributed actor",
         action: event.action.replace("AUTHORIZATION_", ""),
         asset: event.resourceId ?? event.resourceType,
         decision: decisionLabel(event.decision),
         tone: decisionTone(event.decision),
+        reason: event.reason ?? null,
+        txHash: event.transactionHash ?? null,
+        block: event.blockNumber ?? null,
       };
     });
 }
@@ -327,4 +352,83 @@ export function matchesAssetQuery(asset: AssetDisplayRow, query: string): boolea
   const q = query.trim().toUpperCase();
   if (!q) return true;
   return [asset.name, asset.assetId, asset.classification, asset.custodian, asset.status].some(value => value.toUpperCase().includes(q));
+}
+
+/* ------------------------------------------------------------------ */
+/* Permission matrix — honest RBAC surface derived from the role       */
+/* permission catalog (roles ↔ permissions seeded server-side).        */
+/* ------------------------------------------------------------------ */
+
+/** Human labels for each permission key family used in permission displays. */
+const PERMISSION_LABELS: Record<string, string> = {
+  "asset:read": "View assets & provenance",
+  "asset:create": "Register / mint assets",
+  "asset:assign": "Assign asset custody",
+  "asset:transfer": "Transfer asset custody",
+  "asset:revoke": "Revoke assets",
+  "identity:read": "View identities",
+  "identity:create": "Register identities",
+  "identity:update": "Update identities",
+  "identity:revoke": "Revoke identities",
+  "policy:create": "Create policies",
+  "policy:update": "Modify policies",
+  "audit:read": "Read audit evidence",
+  "administration:manage": "Manage administration",
+};
+
+/** Human label for a permission key; unknown keys render their raw key. */
+export function permissionLabel(key: string): string {
+  return PERMISSION_LABELS[key] ?? key;
+}
+
+/** Resource families shown in the compact permission matrix, in display order. */
+export const MATRIX_RESOURCES = ["Assets", "Identities", "Policies", "Audit logs", "Administration"] as const;
+export type MatrixResource = (typeof MATRIX_RESOURCES)[number];
+
+/** The three access levels per resource row in the matrix. */
+export const MATRIX_LEVELS = ["READ", "WRITE", "ADMIN"] as const;
+export type MatrixLevel = (typeof MATRIX_LEVELS)[number];
+
+/**
+ * Map permission keys for a role onto the compact READ/WRITE/ADMIN matrix.
+ * Derived ONLY from the server-provided permission keys — no invented grants.
+ */
+export function permissionMatrix(permissionKeys: string[]): Record<MatrixResource, Record<MatrixLevel, boolean>> {
+  const has = new Set(permissionKeys);
+  const grants: Record<string, [MatrixResource, MatrixLevel][]> = {
+    "asset:read": [["Assets", "READ"]],
+    "asset:create": [["Assets", "WRITE"]],
+    "asset:assign": [["Assets", "WRITE"]],
+    "asset:transfer": [["Assets", "WRITE"]],
+    "asset:revoke": [["Assets", "ADMIN"]],
+    "identity:read": [["Identities", "READ"]],
+    "identity:create": [["Identities", "WRITE"]],
+    "identity:update": [["Identities", "WRITE"]],
+    "identity:revoke": [["Identities", "ADMIN"]],
+    "policy:create": [["Policies", "WRITE"]],
+    "policy:update": [["Policies", "WRITE"]],
+    "audit:read": [["Audit logs", "READ"]],
+    "administration:manage": [["Administration", "ADMIN"]],
+  };
+  const matrix = Object.fromEntries(
+    MATRIX_RESOURCES.map(resource => [resource, Object.fromEntries(MATRIX_LEVELS.map(level => [level, false]))]),
+  ) as Record<MatrixResource, Record<MatrixLevel, boolean>>;
+  for (const key of permissionKeys) {
+    for (const [resource, level] of grants[key] ?? []) matrix[resource][level] = true;
+  }
+  return matrix;
+}
+
+/** Friendly sentence summarizing what a set of roles can do (session panel). */
+export function accessLevelSummary(roles: string[]): string {
+  if (roles.includes("ADMIN")) return "Full control-plane administration";
+  if (roles.includes("MANAGER")) return "Policy + asset management (custody)";
+  if (roles.includes("AUDITOR")) return "Read-only evidence access";
+  if (roles.includes("USER")) return "View assigned assets";
+  return "No SAMPRAAN identity role assigned";
+}
+
+/** Public check/cross glyph for permission displays (never color-only). */
+export function permissionGlyph(ok: boolean): string {
+  return ok ? "✓" : "✕";
 }

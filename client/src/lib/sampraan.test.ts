@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  accessLevelSummary,
   alertMetrics,
   assetMix,
   decisionLabel,
@@ -9,6 +10,9 @@ import {
   formatTxHash,
   initials,
   matchesAssetQuery,
+  permissionGlyph,
+  permissionLabel,
+  permissionMatrix,
   primaryAlert,
   severityTone,
   shortDid,
@@ -17,6 +21,7 @@ import {
   toAuditRows,
   toDecisionRows,
   toEventFeed,
+  truncateMid,
 } from "./sampraan";
 import type { Asset, AuditEvent, Identity } from "@shared/types";
 import type { SecurityAlert } from "./sampraan";
@@ -163,6 +168,58 @@ describe("audit row mapping", () => {
     const feed = toEventFeed([auditEvent({ id: "event-4" })]);
     expect(feed[0].label).toBe("AUTHORIZATION DENIED");
     expect(feed[0].meta).toContain("ASSET-DEMO-FIRMWARE-001");
+  });
+
+  it("carries decision evidence (reason, tx, block, source) for structured cards", () => {
+    const rows = toDecisionRows([auditEvent({ transactionHash: "0xabc123def456", blockNumber: 77 })], [identity()]);
+    expect(rows[0].reason).toBe("Role USER cannot TRANSFER HIGHLY_SENSITIVE asset");
+    expect(rows[0].actorName).toBe("Aarav Mehta");
+    expect(rows[0].fullDid).toBe("did:demo:aarav-mehta");
+    expect(rows[0].txHash).toBe("0xabc123def456");
+    expect(rows[0].block).toBe(77);
+    const auditRows = toAuditRows([auditEvent({ source: "CHAIN_READ_MODEL" })], [identity()]);
+    expect(auditRows[0].source).toBe("CHAIN_READ_MODEL");
+    expect(auditRows[0].reason).toContain("Role USER");
+  });
+});
+
+describe("permission matrix", () => {
+  it("maps admin permission keys onto full READ/WRITE/ADMIN grants", () => {
+    const matrix = permissionMatrix(["asset:read", "asset:create", "asset:assign", "asset:transfer", "asset:revoke", "identity:read", "identity:create", "identity:update", "identity:revoke", "policy:create", "policy:update", "audit:read", "administration:manage"]);
+    expect(matrix["Assets"]).toMatchObject({ READ: true, WRITE: true, ADMIN: true });
+    expect(matrix["Identities"]).toMatchObject({ READ: true, WRITE: true, ADMIN: true });
+    expect(matrix["Policies"]).toMatchObject({ WRITE: true, READ: false });
+    expect(matrix["Administration"]).toMatchObject({ ADMIN: true });
+  });
+
+  it("gives the auditor read-only surface and nothing more", () => {
+    const matrix = permissionMatrix(["asset:read", "audit:read", "identity:read"]);
+    expect(matrix["Assets"]).toMatchObject({ READ: true, WRITE: false, ADMIN: false });
+    expect(matrix["Policies"]).toMatchObject({ READ: false, WRITE: false, ADMIN: false });
+    expect(matrix["Administration"]).toMatchObject({ ADMIN: false });
+  });
+
+  it("never invents grants for unknown permission keys", () => {
+    const matrix = permissionMatrix(["totally:unknown:key"]);
+    expect(Object.values(matrix["Assets"]).every(granted => !granted)).toBe(true);
+  });
+
+  it("labels known permission keys and falls back to the raw key", () => {
+    expect(permissionLabel("asset:transfer")).toBe("Transfer asset custody");
+    expect(permissionLabel("custom:future")).toBe("custom:future");
+  });
+
+  it("summarizes access level per role set and never color-codes permission glyphs", () => {
+    expect(accessLevelSummary(["MANAGER"])).toBe("Policy + asset management (custody)");
+    expect(accessLevelSummary([])).toContain("No SAMPRAAN identity role");
+    expect(permissionGlyph(true)).toBe("✓");
+    expect(permissionGlyph(false)).toBe("✕");
+  });
+
+  it("mid-truncates long technical values keeping both ends", () => {
+    expect(truncateMid("0x1234567890abcdef1234567890abcdef", 8)).toBe("0x123456…90abcdef");
+    expect(truncateMid("short", 8)).toBe("short");
+    expect(truncateMid(null, 8)).toBe("—");
   });
 });
 
