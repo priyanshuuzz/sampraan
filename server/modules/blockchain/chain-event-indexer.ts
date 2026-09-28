@@ -23,6 +23,28 @@ const INDEXED_ACTIONS: Record<string, string> = {
   AssetStatusChanged: "ASSET_STATUS_CHANGED_ON_CHAIN",
   RoleGranted: "ROLE_GRANTED_ON_CHAIN",
   RoleRevoked: "ROLE_REVOKED_ON_CHAIN",
+  // GOVERNANCE + LIFECYCLE read-model projections (document §24/§25):
+  // every auditable state change lands in the same idempotent,
+  // restart-safe, per-event deduped pipeline.
+  IdentityVerified: "USER_VERIFIED_ON_CHAIN",
+  IdentitySuspended: "ACCESS_SUSPENDED_ON_CHAIN",
+  IdentityReactivated: "ACCESS_REACTIVATED_ON_CHAIN",
+  IdentityDeactivated: "IDENTITY_DEACTIVATED_ON_CHAIN",
+  DIDDocumentUpdated: "DID_DOCUMENT_UPDATED_ON_CHAIN",
+  NFTMinted: "NFT_MINTED_ON_CHAIN",
+  NFTAssigned: "NFT_ASSIGNED_ON_CHAIN",
+  NFTRevoked: "NFT_REVOKED_ON_CHAIN",
+  ForcedTransfer: "FORCED_TRANSFER_ON_CHAIN",
+  SystemPaused: "SYSTEM_PAUSED_ON_CHAIN",
+  SystemUnpaused: "SYSTEM_UNPAUSED_ON_CHAIN",
+  DisputeRaised: "DISPUTE_RAISED_ON_CHAIN",
+  DisputeResolved: "DISPUTE_RESOLVED_ON_CHAIN",
+  AnomalyFlagged: "ANOMALY_FLAGGED_ON_CHAIN",
+  AuditReportHashStored: "AUDIT_REPORT_HASH_STORED_ON_CHAIN",
+  ProposalCreated: "GOVERNANCE_PROPOSAL_CREATED_ON_CHAIN",
+  ProposalApproved: "GOVERNANCE_PROPOSAL_APPROVED_ON_CHAIN",
+  ProposalCancelled: "GOVERNANCE_PROPOSAL_CANCELLED_ON_CHAIN",
+  ProposalExecuted: "GOVERNANCE_PROPOSAL_EXECUTED_ON_CHAIN",
 };
 
 export interface IndexerResult {

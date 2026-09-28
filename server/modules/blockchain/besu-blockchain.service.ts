@@ -32,15 +32,19 @@ import {
   type TransactionReceipt,
 } from "ethers";
 import { resolveBlockchainConfig, type BlockchainConfig } from "./blockchain.config";
+import { deriveIdentityWallet } from "./anchoring.service";
 import {
   createAccessControlContract,
   createAssetRegistryContract,
+  createGovernanceContract,
   createIdentityRegistryContract,
   getSampraanAccessControlABI,
   getSampraanAssetRegistryABI,
+  getSampraanGovernanceABI,
   getSampraanIdentityRegistryABI,
   type SampraanAccessControlHandle,
   type SampraanAssetRegistryHandle,
+  type SampraanGovernanceHandle,
   type SampraanIdentityRegistryHandle,
 } from "./contracts";
 import type {
@@ -51,6 +55,8 @@ import type {
 } from "./blockchain.types";
 
 const IDENTITY_STATUS_CODES = { ACTIVE: 1, SUSPENDED: 2, REVOKED: 3 } as const;
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+const ZERO_BYTES32 = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 /**
  * Upper bound for any single RPC round-trip used by health/status surfaces.
@@ -88,6 +94,8 @@ export class BesuBlockchainService {
   private identityContract: SampraanIdentityRegistryHandle | null = null;
   private assetContract: SampraanAssetRegistryHandle | null = null;
   private accessControlContract: SampraanAccessControlHandle | null = null;
+  private governanceContract: SampraanGovernanceHandle | null = null;
+  private governanceApprover: SampraanGovernanceHandle | null = null;
   private initPromise: Promise<void> | null = null;
   /** Serializes submit→mine→evidence cycles; see initialize() BUG-034 note. */
   private submitMutex: Promise<unknown> = Promise.resolve();
@@ -197,6 +205,22 @@ export class BesuBlockchainService {
       this.requireAddress(this.config.assetContractAddress, "asset"),
       this.signer
     );
+    // GOVERNANCE (multisig + timelock): bound only when deployed/configured.
+    // `governanceApprover` uses a SECOND signer key so the backend can drive
+    // the full 2-of-N propose→approve→execute cycle; it is null when no
+    // second key is configured (propose still works via the operator).
+    if (this.config.governanceContractAddress) {
+      this.governanceContract = createGovernanceContract(
+        this.config.governanceContractAddress,
+        this.signer
+      );
+      if (this.config.secondSignerPrivateKey) {
+        this.governanceApprover = createGovernanceContract(
+          this.config.governanceContractAddress,
+          new NonceManager(new Wallet(this.config.secondSignerPrivateKey, this.provider))
+        );
+      }
+    }
   }
 
   private requireAddress(value: string | null, what: string): string {
@@ -299,24 +323,101 @@ export class BesuBlockchainService {
     return evidence!;
   }
 
-  async setIdentityStatus(input: {
+  /**
+   * Promote an on-chain identity from PENDING to VERIFIED.
+   *
+   * The GOVERNANCE revision of the identity registry registers identities as
+   * PENDING: registration alone grants no protected-operation rights, and the
+   * contract refuses to make a PENDING identity an asset custodian or a
+   * transfer recipient (CustodianNotActive / RecipientNotActive). Promotion is
+   * a separate, attributed, reason-carrying step.
+   *
+   * Deliberately NOT idempotent-in-the-loose-sense: it is a no-op (returns
+   * null) unless the current on-chain state is exactly PENDING, so a SUSPENDED
+   * or DEACTIVATED identity is never silently re-activated from here.
+   */
+  async verifyIdentityOnChain(input: {
     walletAddress: string;
-    status: keyof typeof IDENTITY_STATUS_CODES;
-  }): Promise<TransactionEvidence> {
+    reason?: string;
+  }): Promise<TransactionEvidence | null> {
     await this.ensureInitialized();
-    const statusCode = IDENTITY_STATUS_CODES[input.status];
-    if (!statusCode) {
-      throw new Error(`Invalid identity status: ${input.status}`);
-    }
+    const PENDING = 1n;
+    const current = await this.identityContract!.getIdentity(
+      input.walletAddress
+    );
+    if (current.status !== PENDING) return null;
+    const reason =
+      input.reason?.trim() || "identity verified by platform provisioning";
     let evidence: TransactionEvidence;
     await this.enqueueSubmit(async () => {
-      const tx = await this.identityContract!.setStatus(
+      const tx = await this.identityContract!.verifyIdentity(
         input.walletAddress,
-        statusCode
+        reason
       );
       evidence = await this.awaitEvidence(tx, "IDENTITY_STATUS_CHANGE");
     });
     return evidence!;
+  }
+
+  async setIdentityStatus(input: {
+    walletAddress: string;
+    status: keyof typeof IDENTITY_STATUS_CODES;
+    reason?: string;
+  }): Promise<TransactionEvidence> {
+    await this.ensureInitialized();
+    const reason = input.reason?.trim() || `status change to ${input.status}`;
+    let evidence: TransactionEvidence;
+    await this.enqueueSubmit(async () => {
+      // The GOVERNANCE revision of the identity registry replaced the raw
+      // setStatus(code) surface with explicit, reason-carrying transitions
+      // whose preconditions are enforced on-chain. Map the caller's target
+      // state onto the CURRENT on-chain state (a revoke of a PENDING
+      // identity, for example, must fail — deactivation is governance-only,
+      // so “revoke” is interpreted as best-effort suspend when possible).
+      const current = await this.identityContract!.getIdentity(input.walletAddress);
+      if (current.status === 0n) {
+        throw new Error(`Identity ${input.walletAddress} is not registered on-chain`);
+      }
+      const VERIFIED = 2n;
+      const suspended = input.status === "SUSPENDED" || input.status === "REVOKED";
+      let tx;
+      if (suspended && current.status === VERIFIED) {
+        tx = await this.identityContract!.suspendIdentity(input.walletAddress, reason);
+      } else if (!suspended) {
+        // Target ACTIVE: PENDING→verify, SUSPENDED→reactivate.
+        if (current.status === 1n) {
+          tx = await this.identityContract!.verifyIdentity(input.walletAddress, reason);
+        } else {
+          tx = await this.identityContract!.reactivateIdentity(input.walletAddress, reason);
+        }
+      } else {
+        throw new Error(
+          `Identity ${input.walletAddress} cannot be suspended from on-chain state ${current.status} (already inactive, or deactivation requires a governance proposal)`
+        );
+      }
+      evidence = await this.awaitEvidence(tx, "IDENTITY_STATUS_CHANGE");
+    });
+    return evidence!;
+  }
+
+  /**
+   * GOVERNANCE: propose an identity DEACTIVATION (terminal state). On-chain
+   * this is reachable ONLY through the multisig — there is no direct admin
+   * path by design.
+   */
+  async proposeDeactivateIdentity(input: {
+    walletAddress: string;
+    reason: string;
+  }): Promise<{ proposalId: bigint }> {
+    // Deactivation is TERMINAL — route through the same audited multisig
+    // path as every other high-risk operation (binds exact parameters,
+    // requires quorum + timelock, cannot execute twice).
+    const { proposalId } = await this.proposeGovernanceAction({
+      kind: "DEACTIVATE_IDENTITY",
+      account: input.walletAddress,
+      reason: input.reason,
+    });
+    return { proposalId };
   }
 
   async getIdentity(walletAddress: string): Promise<{
@@ -461,8 +562,340 @@ export class BesuBlockchainService {
   }
 
   // ----------------------------------------------------------------
-  // Transaction evidence / receipts
+  // GOVERNANCE (multisig + timelock) — propose/approve/cancel/execute
   // ----------------------------------------------------------------
+
+  private requireGovernance(): SampraanGovernanceHandle {
+    if (!this.governanceContract) {
+      throw new Error(
+        "Governance contract is not configured (BLOCKCHAIN_GOVERNANCE_CONTRACT_ADDRESS / deployment.json missing SampraanGovernance)."
+      );
+    }
+    return this.governanceContract;
+  }
+
+  /** Extract the proposal id from a ProposalCreated log in a receipt. */
+  private extractProposalId(receipt: TransactionReceipt): bigint {
+    for (const log of receipt.logs ?? []) {
+      const parsed = this.parseLog(log);
+      if (parsed && parsed.name === "ProposalCreated") {
+        const pid = (parsed.args as Record<string, unknown>).proposalId;
+        if (typeof pid !== "undefined" && pid !== null) return BigInt(String(pid));
+      }
+    }
+    throw new Error("ProposalCreated event not found in transaction receipt");
+  }
+
+  /**
+   * Propose a high-risk governance operation. Parameters are BOUND at
+   * proposal time on-chain; approvals attach to this exact binding.
+   */
+  async proposeGovernanceAction(input: {
+    kind: "GRANT_ROLE" | "REVOKE_ROLE" | "BURN_NFT" | "FORCE_TRANSFER" | "PAUSE_REGISTRY" | "UNPAUSE_REGISTRY" | "DEACTIVATE_IDENTITY";
+    target?: string;
+    role?: string;
+    account?: string;
+    assetId?: string;
+    reason: string;
+  }): Promise<{ proposalId: bigint; executableAt: bigint; requiredApprovals: bigint }> {
+    await this.ensureInitialized();
+    const gov = this.requireGovernance();
+    const accessControlAddress = this.requireAddress(this.config.accessControlContractAddress, "access control");
+    const assetRegistryAddress = this.requireAddress(this.config.assetContractAddress, "asset");
+    const identityRegistryAddress = this.requireAddress(this.config.identityContractAddress, "identity");
+    const kinds = { GRANT_ROLE: 1, REVOKE_ROLE: 2, BURN_NFT: 3, FORCE_TRANSFER: 4, PAUSE_REGISTRY: 5, UNPAUSE_REGISTRY: 6, DEACTIVATE_IDENTITY: 7 } as const;
+    const kind = kinds[input.kind];
+    const target =
+      input.target ??
+      (input.kind === "BURN_NFT" || input.kind === "FORCE_TRANSFER" || input.kind === "PAUSE_REGISTRY" || input.kind === "UNPAUSE_REGISTRY"
+        ? assetRegistryAddress
+        : input.kind === "DEACTIVATE_IDENTITY"
+          ? identityRegistryAddress
+          : accessControlAddress);
+    if ((input.kind === "BURN_NFT" || input.kind === "FORCE_TRANSFER") && !input.assetId) {
+        throw new Error(`${input.kind} requires an assetId`);
+    }
+    if ((input.kind === "GRANT_ROLE" || input.kind === "REVOKE_ROLE" || input.kind === "DEACTIVATE_IDENTITY") && !input.account) {
+      throw new Error(`${input.kind} requires an account`);
+    }
+    let proposalId = 0n;
+    await this.enqueueSubmit(async () => {
+      const tokenId = input.assetId ? await this.requireAssetToken(input.assetId) : 0n;
+      const tx = await gov.propose(
+        kind,
+        target,
+        input.role ?? ZERO_BYTES32,
+        input.account ?? ZERO_ADDRESS,
+        tokenId,
+        input.reason
+      );
+      const receipt = (await tx.wait(1)) as TransactionReceipt | null;
+      if (!receipt || receipt.status !== 1) throw new Error(`Governance proposal was not mined`);
+      proposalId = this.extractProposalId(receipt);
+    });
+    const state = await gov.proposalState(proposalId);
+    return { proposalId, executableAt: state.executableAt, requiredApprovals: state.requiredApprovals };
+  }
+
+  /** Second-signer approval (auditor fixture key). No-op-safe when absent. */
+  async approveGovernanceProposal(input: { proposalId: bigint; reason?: string }): Promise<{ approvals: bigint; requiredApprovals: bigint }> {
+    await this.ensureInitialized();
+    const gov = this.requireGovernance();
+    if (!this.governanceApprover) {
+      throw new Error("No second governance signer key configured (BLOCKCHAIN_AUDITOR_PRIVATE_KEY); cannot approve");
+    }
+    // The approver key is an independent signer with its own NonceManager,
+    // so the operator submit-mutex does not apply; a single in-flight
+    // approval is enforced by the on-chain AlreadyApproved guard anyway.
+    const tx = await this.governanceApprover.approve(input.proposalId, input.reason ?? "");
+    await this.awaitEvidence(tx, "GOVERNANCE_APPROVE");
+    const state = await gov.proposalState(input.proposalId);
+    return { approvals: state.approvals, requiredApprovals: state.requiredApprovals };
+  }
+
+  /** Cancel a pending proposal (signer-gated on-chain). */
+  async cancelGovernanceProposal(input: { proposalId: bigint; reason: string }): Promise<TransactionEvidence> {
+    await this.ensureInitialized();
+    const gov = this.requireGovernance();
+    let evidence: TransactionEvidence;
+    await this.enqueueSubmit(async () => {
+      const tx = await gov.cancel(input.proposalId, input.reason);
+      evidence = await this.awaitEvidence(tx, "GOVERNANCE_CANCEL");
+    });
+    return evidence!;
+  }
+
+  /**
+   * Execute a proposal that reached quorum AND whose timelock elapsed.
+   * On-chain reverts for: below quorum (NotApprovedEnough), early execution
+   * (TimelockNotElapsed), double execution (AlreadyExecuted), cancelled
+   * (ProposalNotPending) — the contract is the enforcement authority.
+   */
+  async executeGovernanceProposal(input: { proposalId: bigint }): Promise<TransactionEvidence> {
+    await this.ensureInitialized();
+    const gov = this.requireGovernance();
+    let evidence: TransactionEvidence;
+    await this.enqueueSubmit(async () => {
+      const tx = await gov.execute(input.proposalId);
+      evidence = await this.awaitEvidence(tx, "GOVERNANCE_EXECUTE");
+    });
+    return evidence!;
+  }
+
+  async getGovernanceProposal(input: { proposalId: bigint }) {
+    await this.ensureInitialized();
+    const gov = this.requireGovernance();
+    const [core, state] = await Promise.all([gov.proposalCore(input.proposalId), gov.proposalState(input.proposalId)]);
+    return {
+      proposalId: Number(input.proposalId),
+      kind: Number(core.kind),
+      target: core.target,
+      role: core.role,
+      account: core.account,
+      tokenId: core.tokenId.toString(),
+      reason: core.reason,
+      createdAt: Number(state.createdAt),
+      approvals: Number(state.approvals),
+      requiredApprovals: Number(state.requiredApprovals),
+      executableAt: Number(state.executableAt),
+      executed: state.executed,
+      cancelled: state.cancelled,
+      operatorApproved: await gov.proposalHasApproval(input.proposalId, this.operatorAddress),
+    };
+  }
+
+  async listGovernanceProposals(input?: { limit?: number }) {
+    await this.ensureInitialized();
+    const gov = this.requireGovernance();
+    const count = Number(await gov.proposalCount());
+    const limit = Math.min(input?.limit ?? 50, 200);
+    const start = Math.max(1, count - limit + 1);
+    const jobs: Promise<Awaited<ReturnType<BesuBlockchainService["getGovernanceProposal"]>>>[] = [];
+    for (let id = count; id >= start; id--) {
+      jobs.push(this.getGovernanceProposal({ proposalId: BigInt(id) }));
+    }
+    return Promise.all(jobs);
+  }
+
+  async getGovernanceStatus() {
+    await this.ensureInitialized();
+    const gov = this.requireGovernance();
+    const [signers, quorum, delay, count] = await Promise.all([
+      gov.signerCount(),
+      gov.quorumRequired(),
+      gov.timelockDelaySeconds(),
+      gov.proposalCount(),
+    ]);
+    return {
+      signerCount: Number(signers),
+      quorumRequired: Number(quorum),
+      timelockDelaySeconds: Number(delay),
+      proposalCount: Number(count),
+      secondSignerConfigured: Boolean(this.governanceApprover),
+    };
+  }
+
+  // ----------------------------------------------------------------
+  // AUDITOR evidence surfaces (flag-only; never ownership/permission changes)
+  // ----------------------------------------------------------------
+
+  async flagAnomaly(input: { targetWallet: string; assetId: string | null; reason: string }): Promise<TransactionEvidence> {
+    await this.ensureInitialized();
+    const tokenId = input.assetId ? await this.requireAssetToken(input.assetId) : 0n;
+    let evidence: TransactionEvidence;
+    await this.enqueueSubmit(async () => {
+      const tx = await this.assetContract!.flagAnomaly(input.targetWallet, tokenId, input.reason);
+      evidence = await this.awaitEvidence(tx, "ANOMALY_FLAG");
+    });
+    return evidence!;
+  }
+
+  async raiseDispute(input: { assetId: string; evidenceHash: string; reason: string }): Promise<TransactionEvidence & { disputeId: bigint }> {
+    await this.ensureInitialized();
+    const tokenId = await this.requireAssetToken(input.assetId);
+    let evidence: TransactionEvidence;
+    let disputeId = 0n;
+    await this.enqueueSubmit(async () => {
+      const tx = await this.assetContract!.raiseDispute(tokenId, input.evidenceHash, input.reason);
+      evidence = await this.awaitEvidence(tx, "DISPUTE_RAISE");
+      disputeId = this.extractDisputeId(evidence);
+    });
+    return { ...evidence!, disputeId };
+  }
+
+  async resolveDispute(input: { disputeId: bigint; upheld: boolean; reason: string }): Promise<TransactionEvidence> {
+    await this.ensureInitialized();
+    let evidence: TransactionEvidence;
+    await this.enqueueSubmit(async () => {
+      const tx = await this.assetContract!.resolveDispute(input.disputeId, input.upheld, input.reason);
+      evidence = await this.awaitEvidence(tx, "DISPUTE_RESOLVE");
+    });
+    return evidence!;
+  }
+
+  async storeAuditReportHash(input: { reportHash: string }): Promise<TransactionEvidence & { reportId: bigint }> {
+    await this.ensureInitialized();
+    let evidence: TransactionEvidence;
+    let reportId = 0n;
+    await this.enqueueSubmit(async () => {
+      const tx = await this.assetContract!.storeAuditReportHash(input.reportHash);
+      evidence = await this.awaitEvidence(tx, "AUDIT_REPORT_STORE");
+      for (const e of evidence!.events ?? []) {
+        const args = e.args as Record<string, unknown> | undefined;
+        if (e.name === "AuditReportHashStored" && args && typeof args.reportId !== "undefined") {
+          reportId = BigInt(args.reportId as string);
+        }
+      }
+    });
+    return { ...evidence!, reportId };
+  }
+
+  /** §13 auditor verification reads (public views on the registry). */
+  async verifyAssetAuthenticity(tokenId: bigint): Promise<boolean> {
+    await this.ensureInitialized();
+    return this.assetContract!.verifyAuthenticity(tokenId);
+  }
+
+  async verifyAssetOwnership(tokenId: bigint, wallet: string): Promise<boolean> {
+    await this.ensureInitialized();
+    return this.assetContract!.verifyOwnership(tokenId, wallet);
+  }
+
+  async getOwnershipHistory(input: { assetId: string }) {
+    await this.ensureInitialized();
+    const tokenId = await this.requireAssetToken(input.assetId);
+    const length = Number(await this.assetContract!.getCustodyHistoryLength(tokenId));
+    const records: Array<{ fromCustodian: string; toCustodian: string; operator: string; at: bigint }> = [];
+    for (let i = 0; i < length; i++) {
+      records.push(await this.assetContract!.getCustodyRecord(tokenId, i));
+    }
+    return records;
+  }
+
+  /**
+   * DID document update (versioned on-chain). Submitted by the operator via
+   * updateDidDocumentHashFor — the SESSION-AUTHENTICATED controller path:
+   * identity wallets are server-derived references and hold no keys, so the
+   * backend IS the authenticated controller channel.
+   */
+  async updateDidDocument(input: { did: string; documentHash: string; reason: string }): Promise<TransactionEvidence> {
+    await this.ensureInitialized();
+    const operatorKey = this.config.privateKey;
+    if (!operatorKey) throw new Error("Operator key not configured");
+    const walletAddress = deriveIdentityWallet(operatorKey, input.did);
+    let evidence: TransactionEvidence;
+    await this.enqueueSubmit(async () => {
+      const tx = await this.identityContract!.updateDidDocumentHashFor(walletAddress, input.documentHash, input.reason);
+      evidence = await this.awaitEvidence(tx, "DID_DOCUMENT_UPDATE");
+    });
+    return evidence!;
+  }
+
+  /**
+   * AUDITOR-key flag/dispute/report submission: uses the SECOND signer when
+   * it is an actual auditor key (the contract enforces AUDITOR_ROLE for
+   * flagAnomaly/raiseDispute/storeAuditReportHash). Falls back to null when
+   * no second signer is configured — callers then fail with a clear error.
+   */
+  private async withAuditorSigner<T>(task: (auditor: SampraanAssetRegistryHandle) => Promise<T>): Promise<T> {
+    await this.ensureInitialized();
+    if (!this.config.secondSignerPrivateKey) {
+      throw new Error("Auditor signer is not configured (BLOCKCHAIN_AUDITOR_PRIVATE_KEY)");
+    }
+    const auditorAsset = createAssetRegistryContract(
+      this.requireAddress(this.config.assetContractAddress, "asset"),
+      new NonceManager(new Wallet(this.config.secondSignerPrivateKey, this.provider))
+    );
+    return task(auditorAsset);
+  }
+
+  async auditorFlagAnomaly(input: { targetWallet: string; assetId: string | null; reason: string }): Promise<TransactionEvidence> {
+    const tokenId = input.assetId ? await this.requireAssetToken(input.assetId) : 0n;
+    let evidence: TransactionEvidence;
+    await this.withAuditorSigner(async auditor => {
+      const tx = await auditor.flagAnomaly(input.targetWallet, tokenId, input.reason);
+      evidence = await this.awaitEvidence(tx, "ANOMALY_FLAG");
+    });
+    return evidence!;
+  }
+
+  async auditorRaiseDispute(input: { assetId: string; evidenceHash: string; reason: string }): Promise<TransactionEvidence & { disputeId: bigint }> {
+    const tokenId = await this.requireAssetToken(input.assetId);
+    let evidence: TransactionEvidence;
+    let disputeId = 0n;
+    await this.withAuditorSigner(async auditor => {
+      const tx = await auditor.raiseDispute(tokenId, input.evidenceHash, input.reason);
+      evidence = await this.awaitEvidence(tx, "DISPUTE_RAISE");
+      disputeId = this.extractDisputeId(evidence);
+    });
+    return { ...evidence!, disputeId };
+  }
+
+  async auditorStoreAuditReportHash(input: { reportHash: string }): Promise<TransactionEvidence & { reportId: bigint }> {
+    let evidence: TransactionEvidence;
+    let reportId = 0n;
+    await this.withAuditorSigner(async auditor => {
+      const tx = await auditor.storeAuditReportHash(input.reportHash);
+      evidence = await this.awaitEvidence(tx, "AUDIT_REPORT_STORE");
+      for (const e of evidence.events ?? []) {
+        const args = e.args as Record<string, unknown> | undefined;
+        if (e.name === "AuditReportHashStored" && args && typeof args.reportId !== "undefined") {
+          reportId = BigInt(args.reportId as string);
+        }
+      }
+    });
+    return { ...evidence!, reportId };
+  }
+
+  private extractDisputeId(evidence: TransactionEvidence): bigint {
+    for (const e of evidence.events ?? []) {
+      if (e.name === "DisputeRaised") {
+        const args = e.args as Record<string, unknown>;
+        if (typeof args.disputeId !== "undefined") return BigInt(args.disputeId as string);
+      }
+    }
+    throw new Error("DisputeRaised event not found in receipt");
+  }
 
   async getTransaction(transactionHash: string): Promise<TransactionEvidence | null> {
     await this.ensureInitialized();
@@ -489,6 +922,8 @@ export class BesuBlockchainService {
     const addresses = [
       this.config.identityContractAddress,
       this.config.assetContractAddress,
+      this.config.accessControlContractAddress,
+      this.config.governanceContractAddress,
     ].filter((a): a is string => Boolean(a));
     if (addresses.length === 0) return [];
 
@@ -601,6 +1036,11 @@ export class BesuBlockchainService {
       [getSampraanIdentityRegistryABI(), this.config.identityContractAddress],
       [getSampraanAssetRegistryABI(), this.config.assetContractAddress],
       [getSampraanAccessControlABI(), this.config.accessControlContractAddress],
+      // GOVERNANCE events (ProposalCreated/Approved/Executed/Cancelled) join
+      // the indexed read model — idempotent by (transactionHash, logIndex).
+      ...(this.config.governanceContractAddress
+        ? [[getSampraanGovernanceABI(), this.config.governanceContractAddress] as [InterfaceAbi, string]]
+        : []),
     ];
     for (const [abi, address] of candidates) {
       if (!address) continue;
@@ -609,15 +1049,33 @@ export class BesuBlockchainService {
         const iface = new Interface(abi);
         const parsed = iface.parseLog({ topics: log.topics, data: log.data });
         if (!parsed) continue;
+        // ethers v6 stores NAMED Result properties non-enumerably, so
+        // Object.entries/keys on the Result itself only surface positional
+        // indices ("0","1",...). extractProposalId and the chain-event
+        // indexer read named keys (proposalId, tokenId, wallet, didDigest),
+        // which silently never existed — ProposalCreated receipts parsed
+        // fine yet the id extraction still threw. Convert via the Result
+        // API instead: toObject() yields named keys, toArray() positional.
+        const convert = (value: unknown): unknown => {
+          if (typeof value === "bigint") return value.toString();
+          if (value !== null && typeof value === "object" && "toString" in value && !Array.isArray(value)) return String(value);
+          return value;
+        };
         const args: Record<string, unknown> = {};
-        for (const [key, value] of Object.entries(parsed.args as Record<string, unknown>)) {
-          if (typeof value === "bigint") {
-            args[key] = value.toString();
-          } else if (value !== null && typeof value === "object" && "toString" in value) {
-            args[key] = String(value);
-          } else {
-            args[key] = value;
-          }
+        const named =
+          typeof (parsed.args as { toObject?: unknown }).toObject === "function"
+            ? (parsed.args.toObject() as Record<string, unknown>)
+            : null;
+        if (named && Object.keys(named).length > 0) {
+          for (const [key, value] of Object.entries(named)) args[key] = convert(value);
+        } else {
+          const positional =
+            typeof (parsed.args as { toArray?: unknown }).toArray === "function"
+              ? (parsed.args.toArray() as unknown[])
+              : [];
+          positional.forEach((value, index) => {
+            args[String(index)] = convert(value);
+          });
         }
         return {
           name: parsed.name ?? "Unknown",

@@ -363,6 +363,7 @@ export function matchesAssetQuery(asset: AssetDisplayRow, query: string): boolea
 const PERMISSION_LABELS: Record<string, string> = {
   "asset:read": "View assets & provenance",
   "asset:create": "Register / mint assets",
+  "asset:edit": "Edit content & create versions",
   "asset:assign": "Assign asset custody",
   "asset:transfer": "Transfer asset custody",
   "asset:revoke": "Revoke assets",
@@ -398,6 +399,7 @@ export function permissionMatrix(permissionKeys: string[]): Record<MatrixResourc
   const grants: Record<string, [MatrixResource, MatrixLevel][]> = {
     "asset:read": [["Assets", "READ"]],
     "asset:create": [["Assets", "WRITE"]],
+    "asset:edit": [["Assets", "WRITE"]],
     "asset:assign": [["Assets", "WRITE"]],
     "asset:transfer": [["Assets", "WRITE"]],
     "asset:revoke": [["Assets", "ADMIN"]],

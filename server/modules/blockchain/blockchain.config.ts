@@ -18,6 +18,15 @@ export interface BlockchainConfig {
   identityContractAddress: string | null;
   assetContractAddress: string | null;
   accessControlContractAddress: string | null;
+  /** Governance multisig (2-of-N + timelock). Optional: features that need it fail clearly when absent. */
+  governanceContractAddress: string | null;
+  /**
+   * Optional SECOND governance signer key (e.g. the auditor fixture). When
+   * present the backend can complete the 2-of-N propose→approve→execute
+   * cycle end-to-end; when absent only propose/execute-by-others work.
+   * DEV fixture only — production governance signers must NEVER live in env.
+   */
+  secondSignerPrivateKey: string | null;
 }
 
 export interface DeploymentRecord {
@@ -28,11 +37,26 @@ export interface DeploymentRecord {
     SampraanAccessControl: string;
     SampraanIdentityRegistry: string;
     SampraanAssetRegistry: string;
+    SampraanGovernance?: string;
+  };
+  governance?: {
+    quorumPercent: number;
+    timelockDelaySeconds: number;
+    note?: string;
   };
 }
 
 const deploymentFile = (): string =>
   path.join(resolveProjectRoot(), "blockchain", "deployment.json");
+
+/**
+ * DEMO FIXTURE (documented, non-secret): the well-known Besu genesis key used
+ * as the auditor/governance second signer when BLOCKCHAIN_AUDITOR_PRIVATE_KEY
+ * is not configured. Mirrors scripts/deploy-contracts.ts so the backend can
+ * drive the full 2-of-N propose→approve→execute cycle in the demo. NEVER use
+ * in production — real governance signer keys must live outside env/files.
+ */
+const DEMO_LOCAL_AUDITOR_KEY = "0xc87509a1c067bbde78beb793e6fa76530b6382a4c0241e5e4a9ec0a0f44dc0d3";
 
 function readDeployment(): DeploymentRecord | null {
   try {
@@ -88,6 +112,16 @@ export function resolveBlockchainConfig(): BlockchainConfig {
     process.env.BLOCKCHAIN_ACCESS_CONTROL_CONTRACT_ADDRESS ??
     deployment?.contracts.SampraanAccessControl ??
     null;
+  const governanceContractAddress =
+    process.env.BLOCKCHAIN_GOVERNANCE_CONTRACT_ADDRESS ??
+    deployment?.contracts.SampraanGovernance ??
+    null;
+  const secondSignerPrivateKey =
+    isPrivateKey(process.env.BLOCKCHAIN_AUDITOR_PRIVATE_KEY)
+      ? process.env.BLOCKCHAIN_AUDITOR_PRIVATE_KEY
+      : process.env.SAMPRAAN_DEMO_MODE === "off"
+        ? null
+        : DEMO_LOCAL_AUDITOR_KEY;
 
   const besuReady =
     isPrivateKey(privateKey) &&
@@ -103,5 +137,7 @@ export function resolveBlockchainConfig(): BlockchainConfig {
     identityContractAddress,
     assetContractAddress,
     accessControlContractAddress,
+    governanceContractAddress,
+    secondSignerPrivateKey,
   };
 }

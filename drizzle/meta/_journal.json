@@ -36,6 +36,34 @@
       "when": 1789190581042,
       "tag": "0004_true_ben_parker",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "5",
+      "when": 1790480035126,
+      "tag": "0005_moaning_klaw",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "5",
+      "when": 1790483408166,
+      "tag": "0006_many_triton",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "5",
+      "when": 1790558469879,
+      "tag": "0007_governance_lifecycle",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "5",
+      "when": 1790558736309,
+      "tag": "0008_pqc_crypto_assurance",
+      "breakpoints": true
     }
   ]
 }

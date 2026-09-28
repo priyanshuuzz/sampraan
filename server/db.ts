@@ -1,28 +1,43 @@
-import { and, desc, eq, inArray, isNotNull, isNull, max, or } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNotNull, isNull, max, or } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
+  assetAccessGrants,
   assetApprovals,
+  assetContentVersions,
   assetCustody,
+  assetDisputes,
+  assetTransferRequests,
   assets,
+  assuranceChallenges,
   auditEvents,
+  auditReportHashes,
   authorizationDecisions,
+  consentGrants,
+  didDocumentVersions,
   identities,
   didRecords,
+  identityAnomalies,
   identityRoles,
+  keyRecoveryRequests,
+  mintRequests,
+  ownershipPresentations,
   permissions,
   policies,
+  pqcKeyRecords,
   rolePermissions,
   roles,
   securityAlerts,
   sessions,
   users,
   type Asset,
+  type AssetContentVersion,
   type Identity,
   type InsertAsset,
   type InsertIdentity,
   type InsertUser,
 } from "../drizzle/schema";
+import { isDuplicateEntryError } from "./modules/db/db-errors";
 import { ENV } from './_core/env';
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -646,7 +661,7 @@ export async function revokePlatformSession(sessionToken: string): Promise<boole
     .update(sessions)
     .set({ revokedAt: new Date() })
     .where(and(eq(sessions.sessionId, hashSessionToken(sessionToken)), isNull(sessions.revokedAt)));
-  return (result as unknown as { affectedRows?: number }).affectedRows !== 0;
+  return affectedRowsOf(result) > 0;
 }
 
 /**
@@ -823,4 +838,951 @@ export async function markAssetApprovalExecuted(approvalId: string) {
     .set({ status: "EXECUTED", executedAt: new Date() })
     .where(eq(assetApprovals.id, approvalId));
   return getAssetApproval(approvalId);
+}
+
+/* ------------------------------------------------------------------ */
+/* Controlled asset content (versions + access grants)                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Allocate the next version number for an asset and insert the version row
+ * INSIDE one transaction: (assetId, versionNumber) is UNIQUE, so two racing
+ * creates cannot both claim the same number — one insert fails and rolls
+ * back, preventing duplicate/gapped versions under concurrency.
+ */
+export async function createAssetContentVersion(input: {
+  assetId: string;
+  versionNumber: number;
+  filename: string;
+  originalFilename: string;
+  mimeType: string;
+  sizeBytes: number;
+  contentHash: string;
+  storageProvider: string;
+  storageReference: string;
+  encryption: unknown;
+  createdByIdentityId: string;
+  changeNote?: string | null;
+  createdTxHash?: string | null;
+  createdBlockNumber?: number | null;
+}): Promise<AssetContentVersion | undefined> {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = crypto.randomUUID();
+  await db.insert(assetContentVersions).values({
+    id,
+    assetId: input.assetId,
+    versionNumber: input.versionNumber,
+    filename: input.filename,
+    originalFilename: input.originalFilename,
+    mimeType: input.mimeType,
+    sizeBytes: input.sizeBytes,
+    contentHash: input.contentHash,
+    storageProvider: input.storageProvider,
+    storageReference: input.storageReference,
+    encryption: input.encryption as typeof assetContentVersions.$inferInsert["encryption"],
+    createdByIdentityId: input.createdByIdentityId,
+    changeNote: input.changeNote ?? null,
+    createdTxHash: input.createdTxHash ?? null,
+    createdBlockNumber: input.createdBlockNumber ?? null,
+  });
+  const rows = await db.select().from(assetContentVersions).where(eq(assetContentVersions.id, id)).limit(1);
+  return rows[0];
+}
+
+/** Next gapless version number for an asset (1 when no version exists). */
+export async function getNextAssetVersionNumber(assetId: string): Promise<number> {
+  const db = await getDb();
+  if (!db) return 1;
+  const rows = await db
+    .select({ maxVersion: max(assetContentVersions.versionNumber) })
+    .from(assetContentVersions)
+    .where(eq(assetContentVersions.assetId, assetId));
+  return (rows[0]?.maxVersion ?? 0) + 1;
+}
+
+/** All versions of an asset, newest first. */
+export async function listAssetContentVersions(assetId: string): Promise<AssetContentVersion[]> {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(assetContentVersions)
+    .where(eq(assetContentVersions.assetId, assetId))
+    .orderBy(desc(assetContentVersions.versionNumber));
+}
+
+/** One version by row id (assetId NOT checked here — caller must scope). */
+export async function getAssetContentVersionById(versionId: string): Promise<AssetContentVersion | undefined> {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(assetContentVersions).where(eq(assetContentVersions.id, versionId)).limit(1);
+  return rows[0];
+}
+
+/** Count distinct assets that already carry at least one content version. */
+export async function countAssetsWithContent(): Promise<number> {
+  const db = await getDb();
+  if (!db) return 0;
+  const rows = await db
+    .select({ assetId: assetContentVersions.assetId })
+    .from(assetContentVersions)
+    .groupBy(assetContentVersions.assetId);
+  return rows.length;
+}
+
+/**
+ * ACTIVE (non-revoked) access grants for one identity on one asset, resolved
+ * server-side for the authorization boundary. Ownership/custody baselines
+ * are evaluated separately by the policy engine — these rows EXTEND access.
+ */
+export async function listActiveAssetAccessGrants(assetId: string, granteeIdentityId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(assetAccessGrants)
+    .where(
+      and(
+        eq(assetAccessGrants.assetId, assetId),
+        eq(assetAccessGrants.granteeIdentityId, granteeIdentityId),
+        isNull(assetAccessGrants.revokedAt),
+      ),
+    );
+}
+
+/** All grants on an asset (including revoked rows, for the audit surface). */
+export async function listAssetAccessGrants(assetId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(assetAccessGrants)
+    .where(eq(assetAccessGrants.assetId, assetId))
+    .orderBy(desc(assetAccessGrants.createdAt))
+    .limit(200);
+}
+
+/** Grant VIEW or EDIT on an asset to an identity (admin/custodian-managed). */
+export async function createAssetAccessGrant(input: {
+  assetId: string;
+  granteeIdentityId: string;
+  permission: "VIEW" | "EDIT";
+  grantedByIdentityId: string;
+  reason?: string | null;
+}) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = crypto.randomUUID();
+  try {
+    await db.insert(assetAccessGrants).values({
+      id,
+      assetId: input.assetId,
+      granteeIdentityId: input.granteeIdentityId,
+      permission: input.permission,
+      grantedByIdentityId: input.grantedByIdentityId,
+      reason: input.reason ?? null,
+    });
+  } catch (error) {
+    // FINAL-AUDIT FIX (re-grant after revocation, F5): grants are soft-revoked
+    // (revokedAt) but the UNIQUE (assetId, granteeIdentityId, permission)
+    // constraint spans live AND revoked rows, so re-issuing a previously
+    // revoked grant crashed with a raw duplicate-key 500 — a core Manage
+    // Access workflow was single-use. The constraint must STAY (it is what
+    // makes racing grants safe), so a duplicate on a REVOKED row revives it
+    // in one atomic statement: clear revokedAt, refresh attribution/reason.
+    // A duplicate against a LIVE row still surfaces as a conflict.
+    if (!isDuplicateEntryError(error)) throw error;
+    const existing = await db
+      .select({ id: assetAccessGrants.id, revokedAt: assetAccessGrants.revokedAt })
+      .from(assetAccessGrants)
+      .where(
+        and(
+          eq(assetAccessGrants.assetId, input.assetId),
+          eq(assetAccessGrants.granteeIdentityId, input.granteeIdentityId),
+          eq(assetAccessGrants.permission, input.permission),
+        ),
+      )
+      .limit(1);
+    const row = existing[0];
+    if (!row) throw error;
+    if (!row.revokedAt) {
+      throw new Error(
+        `DUPLICATE_ACTIVE_GRANT: ${input.permission} is already granted to this identity on this asset`,
+      );
+    }
+    const revivedId = row.id;
+    await db
+      .update(assetAccessGrants)
+      .set({
+        revokedAt: null,
+        grantedByIdentityId: input.grantedByIdentityId,
+        ...(input.reason !== undefined ? { reason: input.reason ?? null } : {}),
+      })
+      .where(and(eq(assetAccessGrants.id, revivedId), isNotNull(assetAccessGrants.revokedAt)));
+    const rows = await db.select().from(assetAccessGrants).where(eq(assetAccessGrants.id, revivedId)).limit(1);
+    return rows[0];
+  }
+  const rows = await db.select().from(assetAccessGrants).where(eq(assetAccessGrants.id, id)).limit(1);
+  return rows[0];
+}
+
+/** Soft-revoke a grant (history is preserved for audit). */
+export async function revokeAssetAccessGrant(grantId: string): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  const result = await db
+    .update(assetAccessGrants)
+    .set({ revokedAt: new Date() })
+    .where(and(eq(assetAccessGrants.id, grantId), isNull(assetAccessGrants.revokedAt)));
+  return affectedRowsOf(result) > 0;
+}
+
+/** Resolve the asset a grant belongs to (scoped authorization for revocation). */
+export async function getAssetIdForGrant(grantId: string): Promise<{ assetId: string; granteeIdentityId: string; permission: "VIEW" | "EDIT"; revokedAt: Date | null } | undefined> {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db
+    .select({ assetId: assetAccessGrants.assetId, granteeIdentityId: assetAccessGrants.granteeIdentityId, permission: assetAccessGrants.permission, revokedAt: assetAccessGrants.revokedAt })
+    .from(assetAccessGrants)
+    .where(eq(assetAccessGrants.id, grantId))
+    .limit(1);
+  return rows[0];
+}
+
+/* ------------------------------------------------------------------ */
+/* GOVERNANCE LIFECYCLE (document "Role Definitions and Access Rights") */
+/* ------------------------------------------------------------------ */
+
+export async function updateIdentityLifecycle(input: {
+  identityId: string;
+  lifecycleState: "PENDING" | "VERIFIED" | "SUSPENDED" | "DEACTIVATED";
+  statusReason: string;
+}): Promise<Identity | null> {
+  const db = await getDb();
+  if (!db) return null;
+  await db
+    .update(identities)
+    .set({
+      lifecycleState: input.lifecycleState,
+      statusReason: input.statusReason,
+      // Keep the legacy status enum in lockstep so every existing gate
+      // (session gate, content gate, transfer engine) keeps working.
+      ...(input.lifecycleState === "VERIFIED" ? { status: "ACTIVE" as const } : {}),
+      ...(input.lifecycleState === "SUSPENDED" ? { status: "SUSPENDED" as const } : {}),
+      ...(input.lifecycleState === "DEACTIVATED" ? { status: "REVOKED" as const, deactivatedAt: new Date(), revokedAt: new Date() } : {}),
+      ...(input.lifecycleState === "PENDING" ? { status: "SUSPENDED" as const } : {}),
+      ...(input.lifecycleState === "VERIFIED" ? { revokedAt: null, deactivatedAt: null } : {}),
+    })
+    .where(eq(identities.id, input.identityId));
+  // Sync the DID record status (a deactivated/suspended identity must not
+  // keep an ACTIVE DID document — consistent with applyIdentityStatusChange).
+  const identityRows = await db.select().from(identities).where(eq(identities.id, input.identityId)).limit(1);
+  const identity = identityRows[0];
+  if (identity?.did) {
+    await db
+      .update(didRecords)
+      .set({
+        status: input.lifecycleState === "VERIFIED" ? "ACTIVE" : "REVOKED",
+        ...(input.lifecycleState !== "VERIFIED" ? { revokedAt: new Date() } : { revokedAt: null }),
+      })
+      .where(eq(didRecords.did, identity.did));
+  }
+  return identity ?? null;
+}
+
+export async function setIdentityScope(identityId: string, scope: string | null): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(identities).set({ scope }).where(eq(identities.id, identityId));
+}
+
+export async function listIdentitiesInScope(scope: string | null): Promise<Identity[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db.select().from(identities).orderBy(desc(identities.createdAt));
+  if (scope == null) return rows; // global scope (admin/auditor)
+  return rows.filter(row => row.scope === scope || row.organization === scope || row.id === scope);
+}
+
+export async function countActiveAdminIdentities(): Promise<number> {
+  const db = await getDb();
+  if (!db) return 0;
+  const adminRoleRows = await db.select({ id: roles.id }).from(roles).where(eq(roles.name, "ADMIN")).limit(1);
+  const adminRoleId = adminRoleRows[0]?.id;
+  if (!adminRoleId) return 0;
+  const rows = await db
+    .select({ identityId: identityRoles.identityId })
+    .from(identityRoles)
+    .innerJoin(identities, eq(identities.id, identityRoles.identityId))
+    .where(and(eq(identityRoles.roleId, adminRoleId), eq(identities.status, "ACTIVE")));
+  return rows.length;
+}
+
+export async function createMintRequest(input: {
+  assetId: string;
+  name: string;
+  type: string;
+  classification: "PUBLIC" | "CONTROLLED" | "SENSITIVE" | "HIGHLY_SENSITIVE" | "CRITICAL";
+  description?: string | null;
+  integrityHash?: string | null;
+  ownerIdentityId: string;
+  custodianIdentityId: string;
+  requestedByIdentityId: string;
+  requesterScope: string | null;
+}) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = crypto.randomUUID();
+  await db.insert(mintRequests).values({
+    id,
+    assetId: input.assetId,
+    name: input.name,
+    type: input.type,
+    classification: input.classification,
+    description: input.description ?? null,
+    integrityHash: input.integrityHash ?? null,
+    ownerIdentityId: input.ownerIdentityId,
+    custodianIdentityId: input.custodianIdentityId,
+    requestedByIdentityId: input.requestedByIdentityId,
+    requesterScope: input.requesterScope ?? null,
+    status: "PENDING",
+  });
+  const rows = await db.select().from(mintRequests).where(eq(mintRequests.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function getMintRequest(id: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(mintRequests).where(eq(mintRequests.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function listMintRequests(status?: "PENDING" | "APPROVED" | "REJECTED" | "EXECUTED") {
+  const db = await getDb();
+  if (!db) return [];
+  const base = db.select().from(mintRequests).orderBy(desc(mintRequests.createdAt)).limit(100);
+  if (!status) return base;
+  return db.select().from(mintRequests).where(eq(mintRequests.status, status)).orderBy(desc(mintRequests.createdAt)).limit(100);
+}
+
+export async function decideMintRequest(input: { id: string; status: "APPROVED" | "REJECTED"; decidedByIdentityId: string; decisionReason: string }) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db
+    .update(mintRequests)
+    .set({ status: input.status, decidedByIdentityId: input.decidedByIdentityId, decisionReason: input.decisionReason, decidedAt: new Date() })
+    .where(and(eq(mintRequests.id, input.id), eq(mintRequests.status, "PENDING")));
+  if (!result || result[0].affectedRows === 0) return undefined;
+  const rows = await db.select().from(mintRequests).where(eq(mintRequests.id, input.id)).limit(1);
+  return rows[0];
+}
+
+export async function markMintRequestExecuted(id: string, tokenId: string, transactionHash: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  await db
+    .update(mintRequests)
+    .set({ status: "EXECUTED", tokenId, transactionHash, executedAt: new Date() })
+    .where(eq(mintRequests.id, id));
+  const rows = await db.select().from(mintRequests).where(eq(mintRequests.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function createAssetTransferRequest(input: {
+  assetId: string;
+  tokenId: string | null;
+  fromIdentityId: string;
+  toIdentityId: string;
+  requestedByIdentityId: string;
+}) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = crypto.randomUUID();
+  await db.insert(assetTransferRequests).values({
+    id,
+    assetId: input.assetId,
+    tokenId: input.tokenId,
+    fromIdentityId: input.fromIdentityId,
+    toIdentityId: input.toIdentityId,
+    requestedByIdentityId: input.requestedByIdentityId,
+    status: "PENDING",
+  });
+  const rows = await db.select().from(assetTransferRequests).where(eq(assetTransferRequests.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function getAssetTransferRequest(id: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(assetTransferRequests).where(eq(assetTransferRequests.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function listAssetTransferRequests(filter?: { fromIdentityId?: string; toIdentityId?: string; status?: "PENDING" | "ACCEPTED" | "APPROVED" | "REJECTED" | "EXECUTED" | "CANCELLED" }) {
+  const db = await getDb();
+  if (!db) return [];
+  const conditions = [];
+  if (filter?.fromIdentityId) conditions.push(eq(assetTransferRequests.fromIdentityId, filter.fromIdentityId));
+  if (filter?.toIdentityId) conditions.push(eq(assetTransferRequests.toIdentityId, filter.toIdentityId));
+  if (filter?.status) conditions.push(eq(assetTransferRequests.status, filter.status));
+  const query = db.select().from(assetTransferRequests).orderBy(desc(assetTransferRequests.createdAt)).limit(100);
+  if (conditions.length === 0) return query;
+  return db.select().from(assetTransferRequests).where(and(...conditions)).orderBy(desc(assetTransferRequests.createdAt)).limit(100);
+}
+
+export async function updateAssetTransferRequest(id: string, patch: Partial<typeof assetTransferRequests.$inferInsert>) {
+  const db = await getDb();
+  if (!db) return undefined;
+  await db.update(assetTransferRequests).set(patch).where(eq(assetTransferRequests.id, id));
+  const rows = await db.select().from(assetTransferRequests).where(eq(assetTransferRequests.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function createAssetDispute(input: { assetId: string; raisedByIdentityId: string; evidenceHash: string; reason: string }) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = crypto.randomUUID();
+  await db.insert(assetDisputes).values({
+    id,
+    assetId: input.assetId,
+    raisedByIdentityId: input.raisedByIdentityId,
+    evidenceHash: input.evidenceHash,
+    reason: input.reason,
+    status: "OPEN",
+  });
+  const rows = await db.select().from(assetDisputes).where(eq(assetDisputes.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function getAssetDispute(id: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(assetDisputes).where(eq(assetDisputes.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function listAssetDisputes(status?: "OPEN" | "UPHELD" | "REJECTED") {
+  const db = await getDb();
+  if (!db) return [];
+  if (!status) return db.select().from(assetDisputes).orderBy(desc(assetDisputes.createdAt)).limit(100);
+  return db.select().from(assetDisputes).where(eq(assetDisputes.status, status)).orderBy(desc(assetDisputes.createdAt)).limit(100);
+}
+
+/** OPEN or UPHELD disputes for an asset (transfer HOLD check). */
+export async function listOpenDisputesForAsset(assetId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(assetDisputes)
+    .where(and(eq(assetDisputes.assetId, assetId), inArray(assetDisputes.status, ["OPEN", "UPHELD"])));
+}
+
+export async function resolveAssetDispute(input: { id: string; status: "UPHELD" | "REJECTED"; resolvedByIdentityId: string; resolutionReason: string }) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db
+    .update(assetDisputes)
+    .set({ status: input.status, resolvedByIdentityId: input.resolvedByIdentityId, resolutionReason: input.resolutionReason, resolvedAt: new Date() })
+    .where(and(eq(assetDisputes.id, input.id), eq(assetDisputes.status, "OPEN")));
+  if (!result || result[0].affectedRows === 0) return undefined;
+  const rows = await db.select().from(assetDisputes).where(eq(assetDisputes.id, input.id)).limit(1);
+  return rows[0];
+}
+
+export async function createIdentityAnomaly(input: { targetIdentityId: string | null; assetId: string | null; flaggedByIdentityId: string; reason: string }) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = crypto.randomUUID();
+  await db.insert(identityAnomalies).values({
+    id,
+    targetIdentityId: input.targetIdentityId,
+    assetId: input.assetId,
+    flaggedByIdentityId: input.flaggedByIdentityId,
+    reason: input.reason,
+  });
+  const rows = await db.select().from(identityAnomalies).where(eq(identityAnomalies.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function listIdentityAnomalies() {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select().from(identityAnomalies).orderBy(desc(identityAnomalies.createdAt)).limit(100);
+}
+
+export async function createAuditReportHash(input: { auditorIdentityId: string; reportHash: string }) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = crypto.randomUUID();
+  await db.insert(auditReportHashes).values({ id, auditorIdentityId: input.auditorIdentityId, reportHash: input.reportHash });
+  const rows = await db.select().from(auditReportHashes).where(eq(auditReportHashes.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function listAuditReportHashes() {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select().from(auditReportHashes).orderBy(desc(auditReportHashes.createdAt)).limit(100);
+}
+
+export async function getNextDidDocumentVersion(identityId: string): Promise<number> {
+  const db = await getDb();
+  if (!db) return 1;
+  const rows = await db
+    .select({ maxVersion: max(didDocumentVersions.versionNumber) })
+    .from(didDocumentVersions)
+    .where(eq(didDocumentVersions.identityId, identityId));
+  return (rows[0]?.maxVersion ?? 0) + 1;
+}
+
+export async function createDidDocumentVersion(input: { identityId: string; versionNumber: number; documentHash: string; reason: string; createdByIdentityId: string }) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = crypto.randomUUID();
+  await db.insert(didDocumentVersions).values({
+    id,
+    identityId: input.identityId,
+    versionNumber: input.versionNumber,
+    documentHash: input.documentHash,
+    reason: input.reason,
+    createdByIdentityId: input.createdByIdentityId,
+  });
+  const rows = await db.select().from(didDocumentVersions).where(eq(didDocumentVersions.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function listDidDocumentVersions(identityId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(didDocumentVersions)
+    .where(eq(didDocumentVersions.identityId, identityId))
+    .orderBy(desc(didDocumentVersions.versionNumber));
+}
+
+export async function grantConsent(input: { subjectIdentityId: string; verifierDid: string; scope: string; expiresAt: Date }) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = crypto.randomUUID();
+  await db.insert(consentGrants).values({
+    id,
+    subjectIdentityId: input.subjectIdentityId,
+    verifierDid: input.verifierDid,
+    scope: input.scope,
+    expiresAt: input.expiresAt,
+  });
+  const rows = await db.select().from(consentGrants).where(eq(consentGrants.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function listConsents(subjectIdentityId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select().from(consentGrants).where(eq(consentGrants.subjectIdentityId, subjectIdentityId)).orderBy(desc(consentGrants.grantedAt)).limit(100);
+}
+
+export async function revokeConsent(input: { id: string; subjectIdentityId: string }) {
+  const db = await getDb();
+  if (!db) return false;
+  const result = await db
+    .update(consentGrants)
+    .set({ revokedAt: new Date() })
+    .where(and(eq(consentGrants.id, input.id), eq(consentGrants.subjectIdentityId, input.subjectIdentityId), isNull(consentGrants.revokedAt)));
+  return affectedRowsOf(result) > 0;
+}
+
+export async function createKeyRecoveryRequest(input: { subjectIdentityId: string; requestedByIdentityId: string; newKeyDigest: string }) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = crypto.randomUUID();
+  await db.insert(keyRecoveryRequests).values({
+    id,
+    subjectIdentityId: input.subjectIdentityId,
+    requestedByIdentityId: input.requestedByIdentityId,
+    newKeyDigest: input.newKeyDigest,
+    status: "PENDING",
+    guardianApprovals: [],
+  });
+  const rows = await db.select().from(keyRecoveryRequests).where(eq(keyRecoveryRequests.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function getKeyRecoveryRequest(id: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(keyRecoveryRequests).where(eq(keyRecoveryRequests.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function listKeyRecoveryRequests(status?: "PENDING" | "AWAITING_ADMIN" | "APPROVED" | "REJECTED" | "EXECUTED") {
+  const db = await getDb();
+  if (!db) return [];
+  if (!status) return db.select().from(keyRecoveryRequests).orderBy(desc(keyRecoveryRequests.createdAt)).limit(100);
+  return db.select().from(keyRecoveryRequests).where(eq(keyRecoveryRequests.status, status)).orderBy(desc(keyRecoveryRequests.createdAt)).limit(100);
+}
+
+export async function updateKeyRecoveryRequest(id: string, patch: Partial<typeof keyRecoveryRequests.$inferInsert>) {
+  const db = await getDb();
+  if (!db) return undefined;
+  await db.update(keyRecoveryRequests).set(patch).where(eq(keyRecoveryRequests.id, id));
+  const rows = await db.select().from(keyRecoveryRequests).where(eq(keyRecoveryRequests.id, id)).limit(1);
+  return rows[0];
+}
+
+export async function createOwnershipPresentation(input: {
+  subjectIdentityId: string;
+  assetId: string;
+  verifierDid: string;
+  purpose: string;
+  nonce: string;
+  signature: string;
+  keyIdentifier: string;
+  message: string;
+  expiresAt: Date;
+}) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = crypto.randomUUID();
+  await db.insert(ownershipPresentations).values({
+    id,
+    subjectIdentityId: input.subjectIdentityId,
+    assetId: input.assetId,
+    verifierDid: input.verifierDid,
+    purpose: input.purpose,
+    nonce: input.nonce,
+    signature: input.signature,
+    keyIdentifier: input.keyIdentifier,
+    message: input.message,
+    expiresAt: input.expiresAt,
+  });
+  const rows = await db.select().from(ownershipPresentations).where(eq(ownershipPresentations.id, id)).limit(1);
+  return rows[0];
+}
+
+/** Single-use atomic consumption of an ownership presentation (replay-proof). */
+export async function consumeOwnershipPresentation(nonce: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db
+    .update(ownershipPresentations)
+    .set({ consumedAt: new Date() })
+    .where(and(eq(ownershipPresentations.nonce, nonce), isNull(ownershipPresentations.consumedAt), gt(ownershipPresentations.expiresAt, new Date())));
+  if (!result || result[0].affectedRows === 0) return undefined;
+  const rows = await db.select().from(ownershipPresentations).where(eq(ownershipPresentations.nonce, nonce)).limit(1);
+  return rows[0];
+}
+
+/* ------------------------------------------------------------------ */
+/* PQC CRYPTO ASSURANCE (ML-DSA-65 keys + dual-signature challenges)    */
+/* ------------------------------------------------------------------ */
+
+/** The DID half of a key-registration request, resolved server-side. */
+export async function getIdentityByDid(did: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(identities).where(eq(identities.did, did)).limit(1);
+  return rows[0];
+}
+
+export async function getAssetByAssetId(assetId: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(assets).where(eq(assets.assetId, assetId)).limit(1);
+  return rows[0];
+}
+
+/**
+ * Register (or idempotently re-assert) an ACTIVE ML-DSA-65 public key for a
+ * DID. PUBLIC material only — the unique (did, keyIdentifier) index makes a
+ * concurrent double-registration safe: the second write converges on the same
+ * row instead of creating a second authority.
+ */
+export async function registerPqcKeyRecord(input: {
+  identityId: string;
+  did: string;
+  keyIdentifier: string;
+  algorithm: string;
+  publicKey: string;
+  publicKeyFingerprint: string;
+  keySource: "REGISTERED" | "SERVER_DERIVED";
+  registeredByIdentityId?: string | null;
+  note?: string | null;
+}) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = crypto.randomUUID();
+  await db
+    .insert(pqcKeyRecords)
+    .values({
+      id,
+      identityId: input.identityId,
+      did: input.did,
+      keyIdentifier: input.keyIdentifier,
+      algorithm: input.algorithm,
+      publicKey: input.publicKey,
+      publicKeyFingerprint: input.publicKeyFingerprint,
+      keySource: input.keySource,
+      registeredByIdentityId: input.registeredByIdentityId ?? null,
+      note: input.note ?? null,
+      status: "ACTIVE",
+    })
+    .onDuplicateKeyUpdate({
+      set: {
+        algorithm: input.algorithm,
+        publicKey: input.publicKey,
+        publicKeyFingerprint: input.publicKeyFingerprint,
+        keySource: input.keySource,
+        status: "ACTIVE",
+        deactivatedAt: null,
+      },
+    });
+  const rows = await db.select().from(pqcKeyRecords).where(eq(pqcKeyRecords.did, input.did)).limit(50);
+  return rows.find(row => row.keyIdentifier === input.keyIdentifier);
+}
+
+/** The ACTIVE ML-DSA-65 verification key for a DID, or undefined. */
+export async function getActivePqcKeyRecord(did: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db
+    .select()
+    .from(pqcKeyRecords)
+    .where(and(eq(pqcKeyRecords.did, did), eq(pqcKeyRecords.status, "ACTIVE")))
+    .orderBy(desc(pqcKeyRecords.createdAt))
+    .limit(1);
+  return rows[0];
+}
+
+/** Key lifecycle history for a DID (newest first) — audit/evidence surface. */
+export async function listPqcKeyRecords(did: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(pqcKeyRecords)
+    .where(eq(pqcKeyRecords.did, did))
+    .orderBy(desc(pqcKeyRecords.createdAt))
+    .limit(100);
+}
+
+/**
+ * Rotate a DID's PQC key: the outgoing row is marked ROTATED (history is
+ * preserved) and the incoming row becomes ACTIVE, in one transaction so the
+ * DID is never observed with zero ACTIVE PQC keys after a successful rotate.
+ */
+export async function rotatePqcKeyRecord(input: {
+  identityId: string;
+  did: string;
+  previousKeyIdentifier: string;
+  newKeyIdentifier: string;
+  algorithm: string;
+  publicKey: string;
+  publicKeyFingerprint: string;
+  keySource: "REGISTERED" | "SERVER_DERIVED";
+  registeredByIdentityId?: string | null;
+  note?: string | null;
+}) {
+  const db = await getDb();
+  if (!db) return undefined;
+  await db.transaction(async tx => {
+    await tx
+      .update(pqcKeyRecords)
+      .set({ status: "ROTATED", deactivatedAt: new Date(), supersededByKeyIdentifier: input.newKeyIdentifier })
+      .where(and(eq(pqcKeyRecords.did, input.did), eq(pqcKeyRecords.keyIdentifier, input.previousKeyIdentifier)));
+    await tx
+      .insert(pqcKeyRecords)
+      .values({
+        id: crypto.randomUUID(),
+        identityId: input.identityId,
+        did: input.did,
+        keyIdentifier: input.newKeyIdentifier,
+        algorithm: input.algorithm,
+        publicKey: input.publicKey,
+        publicKeyFingerprint: input.publicKeyFingerprint,
+        keySource: input.keySource,
+        registeredByIdentityId: input.registeredByIdentityId ?? null,
+        note: input.note ?? null,
+        status: "ACTIVE",
+      })
+      .onDuplicateKeyUpdate({ set: { status: "ACTIVE", deactivatedAt: null } });
+  });
+  return getActivePqcKeyRecord(input.did);
+}
+
+/** Revoke the ACTIVE PQC key(s) for a DID (immediate, server-side). */
+export async function setPqcKeyStatus(did: string, status: "ACTIVE" | "REVOKED", note?: string | null) {
+  const db = await getDb();
+  if (!db) return false;
+  const result = await db
+    .update(pqcKeyRecords)
+    .set({ status, deactivatedAt: status === "REVOKED" ? new Date() : null, ...(note ? { note } : {}) })
+    .where(eq(pqcKeyRecords.did, did));
+  return affectedRowsOf(result) > 0;
+}
+
+/** Persist a policy-scored assurance challenge (single-use, expiring). */
+export async function createAssuranceChallenge(input: {
+  identityId: string;
+  did: string;
+  operation: string;
+  resourceType: string;
+  resourceId: string;
+  assuranceLevel: "BASELINE" | "ELEVATED" | "QUANTUM_HARDENED";
+  requiredAlgorithms: string[];
+  reasonCodes: string[];
+  audience: string;
+  ecdsaKeyIdentifier: string;
+  pqcKeyIdentifier: string | null;
+  nonce: string;
+  message: string;
+  expiresAt: Date;
+}) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = crypto.randomUUID();
+  await db.insert(assuranceChallenges).values({
+    id,
+    identityId: input.identityId,
+    did: input.did,
+    operation: input.operation,
+    resourceType: input.resourceType,
+    resourceId: input.resourceId,
+    assuranceLevel: input.assuranceLevel,
+    requiredAlgorithms: input.requiredAlgorithms,
+    reasonCodes: input.reasonCodes,
+    audience: input.audience,
+    ecdsaKeyIdentifier: input.ecdsaKeyIdentifier,
+    pqcKeyIdentifier: input.pqcKeyIdentifier,
+    nonce: input.nonce,
+    message: input.message,
+    expiresAt: input.expiresAt,
+  });
+  const rows = await db.select().from(assuranceChallenges).where(eq(assuranceChallenges.id, id)).limit(1);
+  return rows[0];
+}
+
+/**
+ * Atomic single-use consumption of an assurance challenge. The guarded UPDATE
+ * (identity + nonce + unconsumed + unexpired) is what makes concurrent replay
+ * impossible: only one racing caller can flip consumedAt from NULL.
+ */
+export async function consumeAssuranceChallengeAtomic(input: { identityId: string; nonce: string }) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db
+    .update(assuranceChallenges)
+    .set({ consumedAt: new Date() })
+    .where(
+      and(
+        eq(assuranceChallenges.nonce, input.nonce),
+        eq(assuranceChallenges.identityId, input.identityId),
+        isNull(assuranceChallenges.consumedAt),
+        gt(assuranceChallenges.expiresAt, new Date()),
+      ),
+    );
+  if (!result || result[0].affectedRows === 0) return undefined;
+  const rows = await db
+    .select()
+    .from(assuranceChallenges)
+    .where(eq(assuranceChallenges.nonce, input.nonce))
+    .limit(1);
+  return rows[0];
+}
+
+/** Record which half of the dual signature verified (audit evidence). */
+export async function markAssuranceHalfVerified(input: {
+  challengeId: string;
+  ecdsaVerified: boolean;
+  pqcVerified: boolean;
+}) {
+  const db = await getDb();
+  if (!db) return;
+  await db
+    .update(assuranceChallenges)
+    .set({ ecdsaVerified: input.ecdsaVerified, pqcVerified: input.pqcVerified })
+    .where(eq(assuranceChallenges.id, input.challengeId));
+}
+
+/**
+ * Resolve a consumed assurance GRANT for a specific operation + resource.
+ * A grant that is unconsumed, expired outside the validity window, or bound to
+ * a different operation/resource is NOT a grant — this returns undefined and
+ * the caller must fail closed.
+ */
+export async function findValidAssuranceGrant(input: {
+  grantId: string;
+  identityId: string;
+  operation: string;
+  resourceType: string;
+  resourceId: string;
+  notOlderThan: Date;
+}) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db
+    .select()
+    .from(assuranceChallenges)
+    .where(
+      and(
+        eq(assuranceChallenges.id, input.grantId),
+        eq(assuranceChallenges.identityId, input.identityId),
+        eq(assuranceChallenges.operation, input.operation),
+        eq(assuranceChallenges.resourceType, input.resourceType),
+        eq(assuranceChallenges.resourceId, input.resourceId),
+        isNotNull(assuranceChallenges.consumedAt),
+        gt(assuranceChallenges.consumedAt, input.notOlderThan),
+      ),
+    )
+    .limit(1);
+  return rows[0];
+}
+
+/**
+ * Claim an assurance grant for a single execution. The status-guarded UPDATE
+ * (executedAt IS NULL) means only one caller can ever claim a given grant, so
+ * a verified dual signature cannot be replayed across two critical
+ * operations. Returns true when THIS caller won the claim.
+ */
+export async function claimAssuranceGrantExecution(grantId: string): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  const claimed = await db
+    .update(assuranceChallenges)
+    .set({ executedAt: new Date() })
+    .where(and(eq(assuranceChallenges.id, grantId), isNull(assuranceChallenges.executedAt)));
+  // drizzle's mysql2 update() resolves to [ResultSetHeader, FieldPacket[]] —
+  // affectedRows lives on element 0. Reading it off the array yields undefined,
+  // and `undefined !== 0` is TRUE, which silently reported every guarded
+  // UPDATE as a success (proven live: a single-use assurance grant could be
+  // claimed twice). Read the header explicitly.
+  return affectedRowsOf(claimed) > 0;
+}
+
+/**
+ * Rows touched by a drizzle mysql2 write, read from the ResultSetHeader.
+ * Centralised so no call site can repeat the array-vs-header mistake.
+ */
+function affectedRowsOf(result: unknown): number {
+  if (Array.isArray(result)) {
+    const header = result[0] as { affectedRows?: number } | undefined;
+    return typeof header?.affectedRows === "number" ? header.affectedRows : 0;
+  }
+  const header = result as { affectedRows?: number } | null | undefined;
+  return typeof header?.affectedRows === "number" ? header.affectedRows : 0;
+}
+
+/** Assurance challenge history for one identity (audit surface). */
+export async function listAssuranceChallenges(identityId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(assuranceChallenges)
+    .where(eq(assuranceChallenges.identityId, identityId))
+    .orderBy(desc(assuranceChallenges.createdAt))
+    .limit(50);
 }

@@ -1,0 +1,58 @@
+# SAMPRAAN on Render.
+#
+# Deploy:  Render Dashboard → New → Blueprint → point at this repository.
+# Secrets marked `sync: false` are NOT stored here — Render prompts for them and
+# keeps them out of version control.
+#
+# DEPENDENCIES THIS BLUEPRINT DOES NOT PROVISION (documented in docs/deployment.md):
+#   - MySQL 8.x                Render offers managed POSTGRES, which this build
+#                              does not support. Supply an external MySQL URL.
+#   - Hyperledger Besu QBFT    a 4-validator permissioned network is long-running
+#                              infrastructure: run it on a VM/host and point
+#                              BLOCKCHAIN_RPC_URL at it.
+#   - graph-node + IPFS        optional read layer (see graph/).
+services:
+  - type: web
+    name: sampraan
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /ready
+    autoDeploy: true
+    # Migrations run in the release step so a failed migration fails the deploy
+    # instead of leaving the app serving against an out-of-date schema.
+    preDeployCommand: node dist/migrate.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "3000"
+      - key: TRUST_PROXY
+        value: "1"
+      - key: PQC_KEY_PROVIDER
+        value: registered
+      - key: APP_VERSION
+        value: "1.0.0"
+      # ---- secrets / environment-specific (set in the Render dashboard) ----
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: VITE_APP_ID
+        sync: false
+      - key: ASSET_CONTENT_MASTER_KEY
+        sync: false
+      - key: APP_URL
+        sync: false
+      - key: CORS_ORIGIN
+        sync: false
+      - key: BLOCKCHAIN_RPC_URL
+        sync: false
+      - key: BLOCKCHAIN_CHAIN_ID
+        sync: false
+      - key: BLOCKCHAIN_PRIVATE_KEY
+        sync: false
+      - key: IPFS_API_URL
+        sync: false
+      - key: OAUTH_SERVER_URL
+        sync: false

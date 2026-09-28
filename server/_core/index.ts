@@ -3,7 +3,7 @@ import express from "express";
 import { createServer } from "http";
 import net from "net";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
-import { validateSecurityEnv } from "./env";
+import { validateSecurityEnv, describeEnvironment } from "./env";
 import { registerOAuthRoutes } from "./oauth";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
@@ -13,7 +13,11 @@ import { blockchainService } from "../modules/blockchain/blockchain.service";
 import { chainEventIndexer } from "../modules/blockchain/chain-event-indexer";
 import { corsPolicy, rateLimit, requestLogger, securityHeaders } from "../common/security";
 import { safeErrorHandler } from "../common/error-handler";
+import { MAX_UPLOAD_BYTES } from "../modules/asset-content/content.service";
 import { parseListenPort } from "../common/port";
+import { describePqcProvider } from "../modules/crypto-assurance/pqc-key-provider";
+import { checkSchemaReady } from "../modules/db/schema-readiness";
+import { probeKubo } from "../modules/asset-content/kubo.probe";
 
 /**
  * BUG-004 (QA #2): the chain event indexer existed but was never invoked, so
@@ -97,27 +101,89 @@ async function startServer() {
   app.use(corsPolicy);
   app.use(rateLimit());
   app.use(requestLogger);
+  // FINAL-AUDIT FIX (upload body cap parity): content.createVersion is the
+  // DOCUMENTED 20 MiB product upload path (MAX_UPLOAD_BYTES), but the global
+  // 1 MB JSON cap rejected every real upload before the procedure could
+  // enforce its own server-side limit — surfacing as a generic 500 from the
+  // error handler. Register a dedicated JSON parser for the upload route
+  // (method+path matched BEFORE the global parser) with headroom for base64
+  // (~4/3) plus the batch/superjson envelope. body-parser marks req._body so
+  // the later global parser skips double-parsing, and the tRPC mount below
+  // receives the parsed body. The TRUE size limit is still enforced INSIDE
+  // the procedure (decoded bytes > MAX_UPLOAD_BYTES → PAYLOAD_TOO_LARGE);
+  // this cap is transport headroom, not the policy.
+  const uploadLimitMb = Math.ceil((MAX_UPLOAD_BYTES * 4) / 3 / (1024 * 1024)) + 2;
+  app.post("/api/trpc/content.createVersion", express.json({ limit: `${uploadLimitMb}mb` }));
   // Body limits: the API has no legitimate 50 MB payload. A tight cap
   // prevents trivial memory-exhaustion DoS via large JSON bodies.
   app.use(express.json({ limit: "1mb" }));
   app.use(express.urlencoded({ limit: "1mb", extended: true }));
+  /**
+   * GET /health — LIVENESS. Public by design (probes must not need credentials).
+   *
+   * Coarse on purpose: process is up, the database handle is usable, the chain
+   * adapter reports its status (bounded by the RPC timeout so a hung node can
+   * never stall the probe). No secret material, no stack traces, no row data.
+   */
   app.get("/health", async (_req, res) => {
-    // NOTE: intentionally public for liveness probes; returns coarse status
-    // only (no secret material, no stack details).
     const db = await getDb();
-    const blockchain = await blockchainService.getNetworkStatus();
-    res.json({ api: "OK", database: db ? "CONNECTED" : "NOT_CONFIGURED", blockchain });
-  });
-  app.get("/ready", async (_req, res) => {
-    // Readiness gates on the DATABASE only: the chain layer is deliberately
-    // best-effort (anchoring never blocks identity/asset operations), so a
-    // chain outage must not drain the service from the load balancer.
-    // Chain status is still REPORTED (bounded by the RPC timeout) for
-    // diagnostics, but it does not flip readiness.
-    const db = await getDb();
-    const ready = Boolean(db);
     const blockchain = await blockchainService.getNetworkStatus().catch(() => null);
-    res.status(ready ? 200 : 503).json({ ready, database: db ? "CONNECTED" : "NOT_CONNECTED", blockchain });
+    const pqc = describePqcProvider();
+    res.json({
+      api: "OK",
+      database: db ? "CONNECTED" : "NOT_CONFIGURED",
+      blockchain,
+      cryptoAssurance: { provider: pqc.provider, postQuantum: pqc.postQuantum, productionSafe: pqc.productionSafe },
+      environment: describeEnvironment(),
+      uptimeSeconds: Math.round(process.uptime()),
+    });
+  });
+
+  /**
+   * GET /ready — READINESS (503 until the service can actually serve).
+   *
+   * Gates on the DATABASE, including its SCHEMA: a deployment that boots
+   * against an unmigrated database would answer every request with a driver
+   * error, so readiness explicitly checks for the tables the app cannot run
+   * without. This is what makes a Railway/Render deploy fail visibly instead of
+   * serving 500s (the release command runs `node dist/migrate.js` first).
+   *
+   * The chain layer deliberately does NOT gate readiness: anchoring is
+   * best-effort by design (a chain outage must not drain the service from the
+   * load balancer). Chain status is still reported for diagnostics.
+   */
+  app.get("/ready", async (_req, res) => {
+    const db = await getDb();
+    const blockchain = await blockchainService.getNetworkStatus().catch(() => null);
+    const pqc = describePqcProvider();
+
+    let schemaReady = false;
+    let schemaDetail = "NOT_CHECKED";
+    if (db) {
+      try {
+        const probe = await checkSchemaReady();
+        schemaReady = probe.ready;
+        schemaDetail = probe.detail;
+      } catch (error) {
+        schemaDetail = error instanceof Error ? error.message.slice(0, 120) : "SCHEMA_PROBE_FAILED";
+      }
+    }
+
+    const ready = Boolean(db) && schemaReady;
+    // Kubo diagnostics: a REAL bounded add→cat round-trip against the
+    // self-hosted node (15s memo). NOT a readiness gate by design — content
+    // writes fail closed on their own — but a deployment with a dead Kubo
+    // must be visible to the operator, not discovered at first upload.
+    const kubo = await probeKubo();
+    res.status(ready ? 200 : 503).json({
+      ready,
+      database: db ? "CONNECTED" : "NOT_CONNECTED",
+      schema: schemaDetail,
+      kubo,
+      blockchain,
+      cryptoAssurance: { provider: pqc.provider, postQuantum: pqc.postQuantum },
+      environment: describeEnvironment(),
+    });
   });
 
   registerOAuthRoutes(app);

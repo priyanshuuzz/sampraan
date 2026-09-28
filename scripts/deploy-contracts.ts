@@ -108,6 +108,7 @@ async function main() {
   const accessControlArtifact = loadArtifact("SampraanAccessControl");
   const identityArtifact = loadArtifact("SampraanIdentityRegistry");
   const assetArtifact = loadArtifact("SampraanAssetRegistry");
+  const governanceArtifact = loadArtifact("SampraanGovernance");
 
   // 1. Access control
   const acFactory = new ContractFactory(
@@ -120,18 +121,40 @@ async function main() {
   const accessControlAddress = await accessControl.getAddress();
   console.log(`SampraanAccessControl        ${accessControlAddress}`);
 
-  // 2. Identity registry
+  // 2. GOVERNANCE (deployed BEFORE the registries so its address can be
+  //    wired into them). 2-of-3 style: deployer + auditor + a dedicated
+  //    third signer; quorum 67% ⇒ any 2 of 3; timelock 60s for the demo,
+  //    production MUST raise this (documented).
+  const thirdSigner = Wallet.createRandom();
+  console.log(`Governance signer 3         ${thirdSigner.address}  (key NOT persisted — demo quorum met by deployer+auditor)`);
+  const govFactory = new ContractFactory(
+    governanceArtifact.abi,
+    governanceArtifact.bytecode,
+    deployer
+  );
+  const governance = await govFactory.deploy(
+    accessControlAddress,
+    [deployer.address, auditor.address, thirdSigner.address],
+    67, // quorum percent → 2 of 3
+    60, // timelock delay seconds (DEMO; raise in production)
+    deployer.address
+  );
+  await governance.waitForDeployment();
+  const governanceAddress = await governance.getAddress();
+  console.log(`SampraanGovernance           ${governanceAddress}`);
+
+  // 3. Identity registry
   const identityFactory = new ContractFactory(
     identityArtifact.abi,
     identityArtifact.bytecode,
     deployer
   );
-  const identityRegistry = await identityFactory.deploy(accessControlAddress);
+  const identityRegistry = await identityFactory.deploy(accessControlAddress, governanceAddress);
   await identityRegistry.waitForDeployment();
   const identityRegistryAddress = await identityRegistry.getAddress();
   console.log(`SampraanIdentityRegistry     ${identityRegistryAddress}`);
 
-  // 3. Asset registry
+  // 4. Asset registry
   const assetFactory = new ContractFactory(
     assetArtifact.abi,
     assetArtifact.bytecode,
@@ -139,20 +162,37 @@ async function main() {
   );
   const assetRegistry = await assetFactory.deploy(
     accessControlAddress,
-    identityRegistryAddress
+    identityRegistryAddress,
+    governanceAddress
   );
   await assetRegistry.waitForDeployment();
   const assetRegistryAddress = await assetRegistry.getAddress();
   console.log(`SampraanAssetRegistry       ${assetRegistryAddress}`);
 
-  // 4. Grant the auditor address its read-only role.
+  // 5. Grant the auditor address its read-only role.
   const AUDITOR_ROLE = await accessControl.AUDITOR_ROLE();
   const grantTx = await accessControl.grantRole(AUDITOR_ROLE, auditor.address);
   await grantTx.wait();
   console.log(`Granted AUDITOR_ROLE to     ${auditor.address}`);
 
-  // 5. Bootstrap: register deployer + auditor as ACTIVE chain identity references
-  //    (DID digests are deterministic placeholders for the demo identity set).
+  // 5b. Grant the GOVERNANCE CONTRACT the admin roles it executes on behalf
+  //     of the multisig (role administration + asset-status administration).
+  //     The multisig (quorum + timelock) is then the ONLY way to move
+  //     burn/forceTransfer/pause/deactivate through these authorities.
+  const DEFAULT_ADMIN_ROLE = await accessControl.DEFAULT_ADMIN_ROLE();
+  const IDENTITY_ADMIN_ROLE = await accessControl.IDENTITY_ADMIN_ROLE();
+  const ASSET_MANAGER_ROLE = await accessControl.ASSET_MANAGER_ROLE();
+  const g1 = await accessControl.grantRole(DEFAULT_ADMIN_ROLE, governanceAddress);
+  await g1.wait();
+  const g2 = await accessControl.grantRole(IDENTITY_ADMIN_ROLE, governanceAddress);
+  await g2.wait();
+  const g3 = await accessControl.grantRole(ASSET_MANAGER_ROLE, governanceAddress);
+  await g3.wait();
+  console.log(`Granted admin roles to GOVERNANCE ${governanceAddress}`);
+
+  // 6. Bootstrap: register deployer + auditor as identity references and
+  //    VERIFY them (registrations start PENDING in this revision; only
+  //    VERIFIED identities may perform protected on-chain operations).
   const deployerDid = `did:ethr:${deployer.address.toLowerCase()}`;
   const auditorDid = `did:ethr:${auditor.address.toLowerCase()}`;
   const didDigest = (did: string) => keccak256(toUtf8Bytes(did));
@@ -163,7 +203,9 @@ async function main() {
     keccak256(toUtf8Bytes(`pk:${deployer.address.toLowerCase()}`))
   );
   await regDeployer.wait();
-  console.log(`Registered identity ${deployerDid}`);
+  const verDeployer = await identityRegistry.verifyIdentity(deployer.address, "deployment bootstrap: operator");
+  await verDeployer.wait();
+  console.log(`Registered + verified identity ${deployerDid}`);
 
   const regAuditor = await identityRegistry.registerIdentity(
     auditor.address,
@@ -171,7 +213,9 @@ async function main() {
     keccak256(toUtf8Bytes(`pk:${auditor.address.toLowerCase()}`))
   );
   await regAuditor.wait();
-  console.log(`Registered identity ${auditorDid}`);
+  const verAuditor = await identityRegistry.verifyIdentity(auditor.address, "deployment bootstrap: auditor");
+  await verAuditor.wait();
+  console.log(`Registered + verified identity ${auditorDid}`);
 
   const deployment = {
     network: "SAMPRAAN-LOCAL-QBFT",
@@ -180,10 +224,17 @@ async function main() {
     deployedAt: new Date().toISOString(),
     deployerAddress: deployer.address,
     auditorAddress: auditor.address,
+    governanceAddress,
+    governance: {
+      quorumPercent: 67,
+      timelockDelaySeconds: 60,
+      note: "DEMO values — raise the timelock delay for any real deployment",
+    },
     contracts: {
       SampraanAccessControl: accessControlAddress,
       SampraanIdentityRegistry: identityRegistryAddress,
       SampraanAssetRegistry: assetRegistryAddress,
+      SampraanGovernance: governanceAddress,
     },
   };
   writeFileSync(deploymentFile, JSON.stringify(deployment, null, 2) + "\n");

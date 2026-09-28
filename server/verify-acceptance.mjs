@@ -115,7 +115,12 @@ const assetRowId = mint.data?.id;
 // ============================================================
 log("\n=== TEST 3 — ADMIN ASSIGNS CUSTODY TO MANAGER ===");
 const identities2 = await api.call("identities.list");
-const managerIdentity = identities2.data?.find(i => i.roles?.includes("MANAGER"));
+// identities.list is ordered NEWEST-FIRST and the database also holds leftover
+// SUSPENDED identities from governance verifier runs, so a role match alone is
+// not enough: the demo flow needs an ACTIVE identity, exactly as the product's
+// authorization policy requires.
+const isActiveIdentity = i => String(i?.status ?? "").toUpperCase() === "ACTIVE";
+const managerIdentity = identities2.data?.find(i => i.roles?.includes("MANAGER") && isActiveIdentity(i));
 check("manager identity available", !!managerIdentity, managerIdentity?.did);
 const assign = await api.call(
   "assets.assign",
@@ -137,7 +142,7 @@ check("admin-only operation rejected (403)", !adminOp.ok && adminOp.status === 4
 // ============================================================
 log("\n=== TEST 5 — MANAGER TRANSFER (ALLOW/CHALLENGE → real chain tx) ===");
 const managerIdentityList = await api.call("identities.list");
-const userIdentity = managerIdentityList.data?.find(i => i.roles?.includes("USER") && !i.roles?.includes("MANAGER"));
+const userIdentity = managerIdentityList.data?.find(i => i.roles?.includes("USER") && !i.roles?.includes("MANAGER") && isActiveIdentity(i));
 const managerDid = managerIdentityList.data?.find(i => i.linkedUserId === manager.user?.id)?.did;
 check("manager identity DID resolved", !!managerDid, managerDid);
 let managerTransfer = await api.call(

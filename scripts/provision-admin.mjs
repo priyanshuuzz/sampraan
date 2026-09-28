@@ -32,14 +32,30 @@ await conn.execute(
 // Ensure a linked SAMPRAAN identity (reuse the seeded Aarav Mehta ADMIN identity)
 const [identities] = await conn.execute(
   "SELECT id FROM identities WHERE did = ? LIMIT 1",
-  ["did:demo:aarav-mehta"]
+  ["did:sampraan:dev-admin-aarav"]
 );
 if (identities.length === 0) throw new Error("Run pnpm seed:demo first — no demo identity found");
 const identityId = identities[0].id;
-await conn.execute(
-  "UPDATE identities SET linkedUserId = (SELECT id FROM users WHERE openId = ?) WHERE id = ?",
-  [openId, identityId]
-);
+
+// SECURITY FIX (link stealing): this identity is ALREADY linked to the seeded
+// platform admin. Unconditionally re-pointing linkedUserId at the demo user
+// STOLE the link (observed live: the real admin login then resolved no
+// identity and every governance mutation failed with "No SAMPRAAN identity is
+// linked"). Only link when the identity is currently unlinked; if it is
+// linked elsewhere, the demo session mints an UNTRACKED session instead of
+// hijacking the operator's identity or misattributing sessions.
+const [identityRows] = await conn.execute("SELECT linkedUserId FROM identities WHERE id = ? LIMIT 1", [identityId]);
+const currentLink = identityRows[0]?.linkedUserId ?? null;
+let trackSession = true;
+if (currentLink == null) {
+  await conn.execute(
+    "UPDATE identities SET linkedUserId = (SELECT id FROM users WHERE openId = ?) WHERE id = ?",
+    [openId, identityId]
+  );
+} else {
+  console.warn("[provision-admin] identity already linked to platform user " + currentLink + " — NOT stealing the link; issuing an untracked demo session.");
+  trackSession = false;
+}
 
 // Mint the session token exactly like sdk.createSessionToken does.
 const key = new TextEncoder().encode(jwtSecret);
@@ -51,13 +67,16 @@ const token = await new SignJWT({ openId, appId, name: "SAMPRAAN Demo Admin" })
   .sign(key);
 
 // Track the issued platform session so server-side revocation has a row to
-// revoke. SECURITY: sessions.sessionId stores the SHA-256 digest of the token
+// revoke — ONLY when this session genuinely acts as the linked identity.
+// SECURITY: sessions.sessionId stores the SHA-256 digest of the token
 // (matching db.ts hashSessionToken) — never the raw bearer token.
-await conn.execute(
-  "INSERT INTO sessions (id, identityId, sessionId, expiresAt) VALUES (?, ?, ?, ?) " +
-    "ON DUPLICATE KEY UPDATE expiresAt = VALUES(expiresAt), revokedAt = NULL",
-  [randomUUID(), identityId, createHash("sha256").update(token, "utf8").digest("hex"), new Date(Date.now() + 7 * 24 * 3600 * 1000)]
-);
+if (trackSession) {
+  await conn.execute(
+    "INSERT INTO sessions (id, identityId, sessionId, expiresAt) VALUES (?, ?, ?, ?) " +
+      "ON DUPLICATE KEY UPDATE expiresAt = VALUES(expiresAt), revokedAt = NULL",
+    [randomUUID(), identityId, createHash("sha256").update(token, "utf8").digest("hex"), new Date(Date.now() + 7 * 24 * 3600 * 1000)]
+  );
+}
 
 console.log(JSON.stringify({ openId, identityId, token }, null, 2));
 await conn.end();

@@ -123,7 +123,8 @@ export class AnchoringService {
     try {
       const operatorKey = this.requireOperatorKey();
       const walletAddress = deriveIdentityWallet(operatorKey, input.did);
-      let evidence: TransactionEvidence;
+      let evidence: TransactionEvidence | null = null;
+      let alreadyAnchored = false;
       try {
         evidence = await besuBlockchainService.registerIdentity({
           did: input.did,
@@ -131,16 +132,34 @@ export class AnchoringService {
         });
       } catch (error) {
         const reason = describeError(error);
-        if (isAlreadyRegisteredError(reason)) {
-          // Same DID (digest) already anchored — this is an idempotent
-          // re-creation in the read model, not a chain failure.
-          const skipped: AnchorResult = { outcome: "SKIPPED", reason: `Identity ${input.did} is already anchored on-chain`, walletAddress };
-          await persistAnchorAudit({ action: "IDENTITY", resourceId: input.did, result: skipped, metadata: { displayName: input.displayName } });
-          return skipped;
-        }
-        throw error;
+        if (!isAlreadyRegisteredError(reason)) throw error;
+        // Same DID (digest) already anchored — an idempotent re-creation in
+        // the read model, not a chain failure.
+        alreadyAnchored = true;
       }
-      result = { outcome: "ANCHORED", walletAddress, transactionHash: evidence.transactionHash, blockNumber: evidence.blockNumber };
+
+      // The registry registers identities as PENDING and refuses to treat a
+      // PENDING identity as an asset custodian or transfer recipient
+      // (CustodianNotActive / RecipientNotActive — observed live). Promote it
+      // to VERIFIED so the identity is genuinely usable on-chain. This is a
+      // no-op unless the on-chain state is exactly PENDING, so an identity
+      // that is SUSPENDED on-chain is never silently re-activated here.
+      const promotion = await besuBlockchainService.verifyIdentityOnChain({
+        walletAddress,
+        reason: `platform identity provisioning: ${input.displayName}`,
+      });
+
+      if (alreadyAnchored && !promotion) {
+        const skipped: AnchorResult = { outcome: "SKIPPED", reason: `Identity ${input.did} is already anchored on-chain`, walletAddress };
+        await persistAnchorAudit({ action: "IDENTITY", resourceId: input.did, result: skipped, metadata: { displayName: input.displayName, alreadyAnchored: true } });
+        return skipped;
+      }
+      result = {
+        outcome: "ANCHORED",
+        walletAddress,
+        transactionHash: promotion?.transactionHash ?? evidence?.transactionHash,
+        blockNumber: promotion?.blockNumber ?? evidence?.blockNumber,
+      };
     } catch (error) {
       const reason = describeError(error);
       result = { outcome: "FAILED", reason };
@@ -192,6 +211,46 @@ export class AnchoringService {
       resourceId: input.assetId,
       result,
       metadata: { classification: input.classification },
+    });
+    return result;
+  }
+
+  /**
+   * Anchor an asset CONTENT VERSION event on-chain. The chain stores only
+   * digests — assetId digest + content hash digest — never content, never
+   * CIDs (they are provider-specific and the ciphertext reference is NOT a
+   * secret, but the chain evidence model keeps to minimal digests).
+   *
+   * Best-effort: version creation never depends on the chain being up; the
+   * audit event records the anchor outcome either way.
+   */
+  async anchorAssetVersion(input: {
+    assetId: string;
+    contentHash: string;
+    versionNumber: number;
+  }): Promise<AnchorResult | null> {
+    if (!besuBlockchainService) {
+      const result: AnchorResult = { outcome: "SKIPPED", reason: "Blockchain is not configured (MOCK mode); version is not anchored on-chain" };
+      await persistAnchorAudit({ action: "ASSET_VERSION", resourceId: input.assetId, result, metadata: { versionNumber: input.versionNumber } });
+      return result;
+    }
+
+    // The current contract surface stores one metadata digest per asset and
+    // re-minting is forbidden (AssetAlreadyRegistered), so version anchoring
+    // today is EVIDENCE-ONLY: it records a BLOCKCHAIN_ANCHOR_SKIPPED audit
+    // row explaining that the deployed contract has no version-reference
+    // call, while the version's own audit row carries the tx hash once a
+    // version-aware contract method is deployed. This keeps the read model
+    // honest: no fabricated chain evidence is ever written.
+    const result: AnchorResult = {
+      outcome: "SKIPPED",
+      reason: "The deployed SampraanAssetRegistry has no version-reference method; version evidence is recorded in the application audit trail (content hash + audit event) until a version-aware contract upgrade",
+    };
+    await persistAnchorAudit({
+      action: "ASSET_VERSION",
+      resourceId: input.assetId,
+      result,
+      metadata: { versionNumber: input.versionNumber, contentHashDigest: input.contentHash },
     });
     return result;
   }

@@ -2,9 +2,9 @@
 
 **S**ecure **A**sset **M**anagement, **P**rovenance, **RBAC** **A**nd **I**dentity **O**n-chain **N**etwork
 
-SAMPRAAN is a permissioned-blockchain platform for enterprise digital asset management that combines decentralized identity (W3C DID references), smart-contract-enforced access control (on-chain RBAC), controlled asset registration and custody transfer (restricted ERC-721), and a tamper-evident, auditable authorization trail — built on a Hyperledger Besu QBFT network with a MySQL read model.
+SAMPRAAN is a permissioned-blockchain platform for enterprise digital asset management: decentralized identity (W3C DID), smart-contract-enforced access control, a restricted ERC-721 asset registry with governed custody transfer, AES-256-GCM encrypted asset content stored on a self-hosted Kubo IPFS node, policy-driven post-quantum (ML-DSA-65) cryptographic assurance, and a tamper-evident audit/provenance trail — running on Hyperledger Besu QBFT with a MySQL read model.
 
-> **Status:** release candidate (`fd9c89f`). This is a deployment-ready codebase with a reproducible production path (Docker, migrations, backup/restore/rollback), not a claim of proven production operation. Known limitations are listed in [Limitations](#limitations--production-notes).
+> **Status:** release candidate, deployment-ready. A reproducible local production path (build → migrate → start → health/readiness) is verified end-to-end below; Railway/Render configurations ship in this repository but a hosted deployment has **not** been performed.
 
 ---
 
@@ -16,503 +16,334 @@ Built for **Smart India Hackathon 2026**, **Problem Statement 26125** — **Bhar
 
 - Permissioned blockchain for enterprise digital asset management (no public chain, no token economics).
 - Decentralized identity for asset custodians and operators.
-- Smart-contract-enforced access control and authorization — the chain, not the UI, is the authority.
+- Smart-contract-enforced access control — the chain, not the UI, is the authority.
 - Asset provenance: registration, custody assignment, transfer, and lifecycle (suspend/restore/revoke) as on-chain, auditable events.
 - Read-only auditing of the authorization trail.
 
-### B. Additional engineering capabilities implemented by SAMPRAAN (beyond the SIH statement)
+### B. Additional engineering capabilities implemented by SAMPRAAN
 
-- A backend policy engine (server-side, deterministic ALLOW/DENY/CHALLENGE) that runs _before_ chain submission — defense in depth, not a replacement for the contract check.
-- An event indexer that projects on-chain events into a MySQL read model for querying alongside application audit events.
-- Server-side session revocation, appId-bound JWT sessions, and immediate privilege stripping for revoked/suspended identities.
-- Security-intelligence surfaces (alert registry, risk scoring views) that are explicitly **advisory only** — they never grant or bypass authorization.
-- Production hardening: non-root container, fail-closed startup checks, backup/restore/rollback runbooks.
+- AES-256-GCM envelope-encrypted asset content with per-object data keys, stored on the operator's **own Kubo (IPFS) node** — never a third-party pinning service.
+- Governance lifecycle: maker-checker proposals, 2-of-N multisig approval, timelock, and execute-once semantics for high-risk operations, enforced by the `SampraanGovernance` contract.
+- Policy-driven post-quantum cryptographic assurance (ML-DSA-65) layered on the ECDSA/secp256k1 chain baseline.
+- Server-side deterministic risk scoring and step-up authentication (DID-key-signed challenges, single-use, purpose-bound).
+- DID hardening: purpose/audience-bound challenges, replay protection, key rotation and revocation.
+- Session isolation and server-side revocation, appId-bound JWT sessions.
+- Event indexer projecting on-chain events into the MySQL read model.
+- Production hardening: non-root container, fail-closed startup checks, Railway/Render deployment configurations, backup/restore/rollback runbooks.
 
 > IoT device identity/oracle integration is **not** an SIH requirement for this statement and is **not** implemented; it appears only as future work.
 
 ---
 
-## Core Capabilities
-
-| Capability                          | Implementation                                                                                                                                                                                                                        |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **DID / identity lifecycle**        | Off-chain W3C DIDs (`did_records` table); on-chain `SampraanIdentityRegistry` anchors keccak256(DID) → wallet + ACTIVE/SUSPENDED/REVOKED status. Admin-driven status changes mirror on-chain and revoke the derived DID record.       |
-| **Cryptographic authentication**    | OAuth2 authorization-code flow with CSRF `state` nonce cookie; jose HS256 JWT sessions (7-day TTL) bound to `appId`; `httpOnly`, `SameSite=Lax`, `secure` (when HTTPS) cookies; Bearer fallback for cookie-blocked browsers.          |
-| **Roles**                           | `ADMIN`, `MANAGER`, `AUDITOR`, `USER` in the read model (roles/permissions tables); on-chain `DEFAULT_ADMIN_ROLE`, `IDENTITY_ADMIN_ROLE`, `ASSET_MANAGER_ROLE`, `AUDITOR_ROLE` in `SampraanAccessControl`.                            |
-| **RBAC + policy enforcement**       | Backend `AuthorizationService` (identity status → permission → classification rules) evaluated server-side from session + DB; result recorded as `authorization_decisions` + audit event. Frontend checks are UX only.                |
-| **Enterprise asset registry**       | MySQL `assets` table with 5-level classification enum (PUBLIC…CRITICAL), owner/custodian separation, integrity hash; classification constrained at the **database layer**, not just the API.                                          |
-| **NFT-backed asset representation** | `SampraanAssetRegistry` — ERC-721 (OpenZeppelin) with marketplace primitives (`approve`, `setApprovalForAll`, `transferFrom`, `safeTransferFrom`) **permanently disabled**; custody changes only via the guarded `transferCustody()`. |
-| **Restricted minting**              | `registerAsset()` requires `ASSET_MANAGER_ROLE` on-chain; API-side asset creation is an admin-only tRPC procedure; each mint anchors on-chain (digests only).                                                                         |
-| **Asset assignment / custody**      | `assignAsset()` and `transferCustody()` enforce role, asset-status, and both custodian identities being ACTIVE — all on-chain. Custody history tracked in `asset_custody`.                                                            |
-| **Blockchain audit evidence**       | Every confirmed transfer records `transactionHash`, `blockNumber`, `blockHash`, `gasUsed` in `audit_events`; chain rejection records `BLOCKCHAIN_TRANSACTION_FAILED` — never a misleading success.                                    |
-| **Event indexing**                  | `chain-event-indexer.ts` runs every 30s, projects recognized contract events into `audit_events` (`source: CHAIN_READ_MODEL`), idempotent across restarts via persisted tx-hash dedup.                                                |
-| **Security intelligence**           | `security_alerts` registry (severity, status, riskScore) surfaced through an advisory Intelligence/Alerts workspace; never part of the authorization decision.                                                                        |
-| **Identity revocation**             | Admin `identities.setStatus` → read model + DID record + on-chain anchor, and the session gate rejects the next authenticated request from a REVOKED/SUSPENDED linked identity.                                                       |
-| **Session revocation**              | Logout revokes the server-side session row (cookie _and_ Bearer channels); tracked sessions are rejected immediately, before JWT expiry.                                                                                              |
-| **Production security controls**    | CSP/HSTS/nosniff/frame-deny headers; fail-closed CORS; memory-bounded rate limiting (120 req/min/IP); 1 MB body cap; error masking of unexpected internals; non-root Docker user; fail-closed startup on weak `JWT_SECRET`.           |
-
----
-
 ## Architecture
 
-### Request path (write/authorization)
-
 ```
-Browser (React 19 SPA — wouter, Tailwind 4, shadcn-style UI)
+Frontend (React 19 SPA — wouter, Tailwind 4, tRPC client)
         │  tRPC v11 over HTTP (superjson, httpBatchLink)
         ▼
-Express 5 server (server/_core/index.ts)
-        │  securityHeaders → corsPolicy → rateLimit → requestLogger → 1MB body cap
+Backend/API (Express 5 + tRPC 11, Node 22)  ── authorization/policy layer (RBAC+ABAC, risk, step-up)
+        │                    │
+        │                    ├── MySQL 8.4 (read model: identities, assets, content versions, audit, sessions)
+        │                    ├── Self-hosted Kubo IPFS (encrypted asset content blobs; operator-controlled node)
+        │                    └── Besu QBFT JSON-RPC (contracts: AccessControl, IdentityRegistry, AssetRegistry, Governance)
         ▼
-tRPC procedures (server/routers.ts) — publicProcedure / protectedProcedure / adminProcedure
-        │  session verify (jose JWT + server-side revocation + linked-identity status)
+Chain event indexer (30s schedule, tx-hash dedup) → MySQL audit read model
         ▼
-Authorization / policy layer (authorization.service.ts)
-        │  deterministic ALLOW / DENY / CHALLENGE; decision + audit rows persisted
-        ▼
-Smart contracts (SampraanAccessControl · SampraanIdentityRegistry · SampraanAssetRegistry)
-        │  contract INDEPENDENTLY re-verifies role, identity status, asset state
-        ▼
-Hyperledger Besu QBFT network (4 validators, chain ID 4224, 2s blocks, immediate finality)
+Graph/query layer (optional: graph-node + subgraph; the app also decodes events directly from RPC)
 ```
 
-### Evidence path (read/audit)
+### Content storage — encryption BEFORE IPFS
+
+Sensitive asset content is **AES-256-GCM encrypted before it is handed to IPFS**:
 
 ```
-Smart-contract events (IdentityRegistered, AssetTransferred, RoleGranted, …)
-        ▼
-Chain event indexer (chain-event-indexer.ts — 30s schedule, tx-hash dedup)
-        ▼
-MySQL read model (audit_events, source = CHAIN_READ_MODEL)
-        ▼
-Audit Evidence workspace / dashboards (protected tRPC queries)
+plaintext ──► AES-256-GCM (per-object data key, wrapped by ASSET_CONTENT_MASTER_KEY)
+        ──► encrypted blob ──► self-hosted Kubo (operator's own node, pinned)
+        ──► CID ──► database reference (asset_content_versions.storageReference) + provenance
 ```
 
-**Division of responsibility** (confirmed by the code): the **blockchain is the trusted state-transition and evidence layer** — it independently re-verifies every protected transition and holds the tamper-evident record. **MySQL is the read model** — full application data, DID documents, asset metadata, audit query projections. The database is never moved on-chain, and chain data is never assumed without on-chain verification.
+- IPFS is **self-hosted Kubo** (`IPFS_API_URL`); no public IPFS gateway is required and none is used.
+- The IPFS CID is a **storage/content reference only — it is NOT an authorization mechanism**. Knowing a CID grants nothing.
+- **Authorization occurs before content retrieval/decryption**: RBAC/ABAC + classification + step-up policy are evaluated server-side before the blob is fetched from Kubo and decrypted.
+
+### Division of responsibility
+
+The **blockchain is the trusted state-transition and evidence layer** — contracts independently re-verify every protected transition. **MySQL is the read model** — application data, DID documents, content-version metadata, audit projections. The database is never moved on-chain; chain data is never assumed without on-chain verification.
 
 ---
 
 ## Technology Stack
 
-Verified against `package.json` / `pnpm-lock.yaml` at the release candidate:
+| Layer            | Technology                                                                                                                                                             |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Frontend         | React 19, TypeScript 5.9, Vite 8, wouter 3, Tailwind CSS 4, shadcn-style UI, Radix primitives, TanStack Query 5                                                         |
+| API              | Node.js 22, Express 5, tRPC 11, superjson, Zod 4                                                                                                                       |
+| Auth             | jose 6 (HS256 JWT, appId-bound), OAuth2 authorization-code flow, DID-signed step-up challenges (ethers 6, secp256k1)                                                    |
+| Database         | MySQL 8.4, Drizzle ORM + drizzle-kit (append-only migrations)                                                                                                          |
+| Blockchain       | Hyperledger Besu 25.10 (QBFT, 4 validators), ethers 6                                                                                                                  |
+| Smart contracts  | Solidity 0.8.30 (solc pinned), OpenZeppelin Contracts 5.3 (`AccessControl`, `ERC721`)                                                                                  |
+| Content storage  | AES-256-GCM (Node crypto), self-hosted Kubo IPFS HTTP RPC (`IPFS_API_URL`)                                                                                             |
+| PQC assurance    | `@noble/post-quantum` — ML-DSA-65, policy-driven (`registered` key provider in production)                                                                             |
+| Tooling          | pnpm 10, Vitest 5, esbuild, Docker + Docker Compose                                                                                                                    |
+| E2E verification | Python + Playwright harnesses (`scripts/e2e-browser.py`, `scripts/e2e-session-isolation.py`) + Node live verifiers (`server/verify-*.mjs`, `scripts/verify-*.mts`)      |
 
-| Layer            | Technology                                                                                                                                                                                                |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Frontend         | React 19.2, TypeScript 5.9, Vite 8, wouter 3 (routing), Tailwind CSS 4, shadcn-style component set (53 components in `client/src/components/ui`), Radix UI primitives, TanStack Query 5, sonner, recharts |
-| API              | Node.js 22, Express 5, tRPC 11 (server + client), superjson, Zod 4                                                                                                                                        |
-| Auth             | jose 6 (HS256 JWT), OAuth2 authorization-code flow, `cookie` parsing                                                                                                                                      |
-| Database         | MySQL 8.4, Drizzle ORM 0.45 + drizzle-kit 0.31 (append-only migrations)                                                                                                                                   |
-| Blockchain       | Hyperledger Besu 25.10.0 (QBFT consensus, 4 validators), ethers 6                                                                                                                                         |
-| Smart contracts  | Solidity 0.8.30 (solc pinned via npm, `evmVersion=paris`), OpenZeppelin Contracts 5.3 (`AccessControl`, `ERC721`)                                                                                         |
-| Tooling          | pnpm 10 (workspace + patchedDependencies), Vitest 5, Prettier 3, esbuild (server bundle), Docker + Docker Compose                                                                                         |
-| E2E verification | Python + Playwright helper scripts (`scripts/frontend-verify.py`, `scripts/ui-flow-a.py`) — local verification tools, not part of `pnpm test`                                                             |
-
-Not used (do not expect): PostgreSQL, NestJS, Prisma, Next.js.
+Not used: PostgreSQL, NestJS, Prisma, Next.js, any third-party IPFS pinning service.
 
 ---
 
-## Repository Structure
+## Security
+
+- **AES-256-GCM envelope encryption.** Every content version gets a fresh 32-byte data key; the data key encrypts the blob (AES-256-GCM, random 12-byte nonce, auth tag), and the data key itself is wrapped with `ASSET_CONTENT_MASTER_KEY`. The master key never touches stored data; decrypting requires both the master key (server env) and the wrapped key (DB row).
+- **Per-object flow.** plaintext → AES-256-GCM encrypt → encrypted blob → Kubo add (pinned) → CID stored in DB with `contentHash = sha256(plaintext)`; read path: authorize → fetch CID → unwrap key → decrypt → verify hash → serve (`disposition: view`).
+- **Encrypted blobs in Kubo.** Only ciphertext leaves the server. Verified live: the plaintext marker never appears in raw Kubo bytes for the stored CID; the CID is derived from ciphertext, so V1/V2 of the same asset have distinct CIDs.
+- **Integrity verification.** `content.verifyIntegrity` re-fetches the blob, decrypts, and compares against the stored `contentHash`; tampering with Kubo data (or a wrong CID) fails verification and retrieval.
+- **DID challenge/nonce/replay protection.** Sensitive operations require a server-issued, purpose- and audience-bound, identity-bound challenge signed with the identity's DID key; challenges are single-use — replay and cross-purpose reuse are rejected (live-verified).
+- **ECDSA/secp256k1 baseline.** Chain transactions and DID authentication use secp256k1 ECDSA (ethers 6). This is the EVM baseline.
+- **ML-DSA-65 policy-driven PQC assurance.** On top of the ECDSA baseline, high-risk/irreversible operations can require an ML-DSA-65 signature from a **registered** public key (production default: `registered` only; dev derivation refused in production). **ML-DSA does not replace ECDSA** — SAMPRAAN uses policy-driven cryptographic assurance: the policy engine decides per operation which algorithms/signatures are required, and ECDSA remains the chain signature scheme.
+- **RBAC.** Roles `ADMIN`, `MANAGER`, `AUDITOR`, `USER` in the read model; on-chain `DEFAULT_ADMIN_ROLE`, `IDENTITY_ADMIN_ROLE`, `ASSET_MANAGER_ROLE`, `AUDITOR_ROLE` in `SampraanAccessControl`. Every mutating procedure re-checks role server-side; the contract re-checks on-chain.
+- **ABAC.** Asset classification (5 levels, PUBLIC→CRITICAL) is resolved server-side from the DB — client-asserted classification/ownership never influences a decision (test-proven). Classification constrains who may read/edit/transfer.
+- **Deterministic risk scoring.** Risk policy derives a score from action, classification, and identity state; score + policy decide ALLOW / DENY / CHALLENGE deterministically. Security-intelligence surfaces (alerts, risk views) are advisory only and never grant authorization.
+- **Step-up authentication.** High-risk reads/edits/transfers require a fresh DID-key-signed step-up challenge (single-use, purpose-bound, short TTL). Verified live: a valid step-up unlocks exactly one purpose-bound action; replay is rejected.
+- **Multisig (2-of-N) + timelock.** Governance operations route through the `SampraanGovernance` contract: proposer (maker) → distinct approvers reach quorum → timelock delay → execute. The contract enforces distinct-actor approval (no self-approval).
+- **Maker-checker.** Asset mint and high-risk flows are maker-checker end-to-end: the maker cannot approve their own proposal (403, live-verified), and state transitions are guarded (412 on invalid transitions).
+- **Controlled transfer.** ERC-721 marketplace primitives (`approve`, `setApprovalForAll`, `transferFrom`, `safeTransferFrom`) are permanently disabled in `SampraanAssetRegistry`; custody changes only via the guarded `transferCustody()` (role + both custodians ACTIVE + asset ACTIVE on-chain) and the governed transfer workflow (request → recipient accept → admin approve → execute, with step-up where policy requires).
+- **Audit/provenance.** Application decisions and chain evidence in `audit_events` (transactionHash, blockNumber, blockHash); top-level provenance query reconstructs an asset's full history from application + chain events (16-entry verified trail in E2E). The read model can be rebuilt from the chain.
+- **Session security.** Server-side session tracking + revocation (logout kills cookie and Bearer channels immediately), appId-bound JWTs, `httpOnly` `SameSite=Lax` cookies, no token in JS-visible storage (browser-verified).
+- **Platform hardening.** CSP, HSTS (under TLS/proxy), nosniff, frame-deny; fail-closed CORS; memory-bounded rate limiting (120 req/min/IP, 429 + Retry-After); 1 MB body cap with a dedicated parser for the 20 MiB content upload (deterministic 413); error masking; non-root Docker user; fail-closed startup on weak secrets.
+
+---
+
+## IPFS / Kubo
+
+Actual flow:
 
 ```
-sampraan/
-├── client/                  # React SPA
-│   ├── index.html
-│   └── src/
-│       ├── App.tsx          # wouter routes: / → Home, 404 fallback
-│       ├── main.tsx         # tRPC client + QueryClientProvider
-│       ├── pages/           # Home.tsx (landing + auth gate + workspace), NotFound.tsx
-│       ├── components/      # DashboardLayout, ErrorBoundary, ui/ (shadcn-style set)
-│       ├── hooks/           # useSampraanData (tRPC queries + demo fallback)
-│       └── lib/             # sampraan.ts (display helpers), trpc.ts, utils.ts
-├── server/
-│   ├── _core/               # Express bootstrap, security middleware, sdk/oauth/session, vite/static
-│   ├── common/              # security.ts (headers/CORS/rate-limit), error-handler.ts
-│   ├── modules/
-│   │   ├── authorization/   # policy engine (ALLOW/DENY/CHALLENGE)
-│   │   ├── blockchain/      # Besu adapter, facade, config, contracts.ts, chain-event-indexer, anchoring
-│   │   ├── db/              # duplicate-key error mapping
-│   │   └── trust-domain/    # in-memory demo domain (delegates to policy engine)
-│   ├── routers.ts           # tRPC appRouter (health, auth, identities, assets, audit, alerts, blockchain)
-│   ├── db.ts                # Drizzle data layer + session tracking/revocation
-│   └── seed-demo.mjs        # fictional demo data
-├── contracts/               # Solidity: SampraanAccessControl, SampraanIdentityRegistry, SampraanAssetRegistry + interfaces
-├── blockchain/
-│   ├── artifacts/           # deterministic compile output (ABI + bytecode)
-│   ├── deployment.json      # contract addresses from the last deploy
-│   └── network/             # QBFT config, genesis, docker-compose (4 validators)
-├── drizzle/                 # migrations (0000–0002) + schema.ts
-├── scripts/
-│   ├── compile-contracts.ts # solc standard-JSON build (OZ inlined)
-│   ├── deploy-contracts.ts  # deploy + role grants + deployment.json
-│   ├── provision-admin.mjs  # local demo: admin user + session token
-│   ├── provision-user.mjs   # local demo: linked user + session token
-│   ├── reset-custody.mjs    # one-shot on-chain custody reset (demo)
-│   ├── ops/                 # backup.sh, restore.sh, rollback-app.sh, mysql-backup.cnf
-│   └── frontend-verify.py / ui-flow-a.py  # Playwright verification helpers
-├── docs/                    # operations.md, blockchain.md, integration-notes.md, openapi.yaml
-├── Dockerfile               # multi-stage, non-root, reproducible
-├── docker-compose.production.yml   # app + MySQL 8.4
-└── package.json / pnpm-lock.yaml / pnpm-workspace.yaml
+plaintext ──► AES-256-GCM ──► encrypted blob ──► self-hosted Kubo (add + pin) ──► CID ──► database/provenance reference
+```
+
+- `IPFS_API_URL` — the Kubo HTTP RPC API endpoint (e.g. `http://127.0.0.1:5001/api/v0`). Bare `host:port` is normalized to `/api/v0` automatically.
+- **Production requires a reachable self-hosted Kubo API.** Startup and content operations fail closed without it — there is no silent local-filesystem fallback and no third-party IPFS provider in production.
+- No public IPFS gateways are used or recommended; content is ciphertext anyway, but the node is the operator's own.
+- **Railway/Render do not host Kubo.** Kubo must run on infrastructure controlled by the operator (same host, private network, or a reachable self-hosted server), and `IPFS_API_URL` must point at it. One Kubo container can be run adjacent to the app; the repository does not manage the Kubo lifecycle for you.
+- Readiness reports Kubo status: `GET /ready` returns `kubo:{configured,reachable,cid}` from a real bounded add→cat round-trip probe (memoized 15s). Kubo is reported, not a hard gate — but content operations fail closed when it is down (verified: upload and retrieval fail with no fake success).
+- No IPFS credentials are used — the operator's node, operator's network.
+
+---
+
+## Blockchain
+
+- **Hyperledger Besu** permissioned network, **QBFT** consensus (4 validators, 2s blocks, immediate finality — no reorgs), local chain ID **4224** (configurable via `BLOCKCHAIN_CHAIN_ID`; a mismatch refuses to bind contracts).
+- Contracts (Solidity 0.8.30, OpenZeppelin 5.3): `SampraanAccessControl` (roles), `SampraanIdentityRegistry` (DID→wallet + status), `SampraanAssetRegistry` (restricted ERC-721), `SampraanGovernance` (multisig + timelock target).
+- **Real transaction receipts**: every protected transition submits a real transaction and waits for the receipt; `transactionHash`, `blockNumber`, `blockHash`, `gasUsed` are recorded as audit evidence. Chain rejection records `BLOCKCHAIN_TRANSACTION_FAILED` — never a misleading success.
+- **Event indexing**: `chain-event-indexer.ts` (30s schedule) projects contract events into `audit_events` (source `CHAIN_READ_MODEL`), idempotent across restarts via persisted tx-hash dedup.
+- **Provenance**: full per-asset history (registration, mint, activation, assignment, custody transfers, content versions, governed actions) from application + chain events; custody read-model sync after on-chain transfer is live-verified.
+- **NFT ownership/custody**: each asset is an ERC-721 token in `SampraanAssetRegistry`; marketplace transfers are permanently disabled — custody moves only through the guarded, governed path. Governed mint activates the asset on-chain post-execute (verified: first post-mint transfer succeeds).
+- Only digests and addresses go on-chain — never PII or content bytes.
+
+---
+
+## Identity
+
+- **DID**: off-chain W3C DID documents (`did_records`); on-chain `keccak256(DID)` → wallet + status anchor in `SampraanIdentityRegistry`.
+- **Identity lifecycle**: register → verify/activate → suspend → reactivate → revoke; every status change mirrors on-chain and immediately strips session access (next request is rejected).
+- **Key rotation & revocation**: identity signing keys rotate with versioned DID documents; revoked keys fail signature verification; revocation is enforced in challenge verification and step-up.
+- **Verification**: DID-signed authentication challenges (purpose/audience-bound) and step-up challenges; verification happens server-side against the current key material.
+- **Suspension/deactivation**: suspended/revoked identities cannot pass the session gate, receive step-up challenges, or act on-chain (contract also enforces identity status).
+- **Replay protection**: single-use nonces for authentication and step-up challenges; concurrent and cross-purpose replays rejected (live-verified).
+
+---
+
+## Roles
+
+| Role        | Authorization boundary                                                                                                                                                                                                                             |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **ADMIN**   | Full platform administration: identity lifecycle (verify/suspend/revoke), role/permission management, governance approvals (checker), identity status changes, system configuration. Cannot bypass maker-checker (cannot approve own proposals — 403). |
+| **MANAGER** | Asset operations within scope: create/request assets, mint proposals (maker), execute governed actions after approval, custody assignment and controlled transfers (with step-up where policy requires). No user/role administration.                |
+| **AUDITOR** | Read-only: audit trail, provenance, compliance views, integrity verification. No mutation rights anywhere — attempts are denied server-side and audited (live-verified 403s).                                                                       |
+| **USER**    | Self-service: view assets assigned to them, accept inbound custody transfers, view content they are granted access to (grant-scoped). No administrative or minting capability.                                                                       |
+
+Role resolution is server-side only (session → DB); frontend checks are UX only. On-chain, the contracts re-verify roles independently.
+
+---
+
+## Governance
+
+High-risk actions route through a governed pipeline enforced by the `SampraanGovernance` contract:
+
+- **Maker-checker**: a proposer (maker) creates a request; a distinct actor (checker/admin) must approve — self-approval is rejected on-chain and at the API (403, live-verified).
+- **Multisig quorum**: 2-of-N approval on the governance contract before execution; approvals are distinct-actor and tracked on-chain.
+- **Timelock**: approved proposals wait out a timelock delay before execution, giving a window to detect and react to compromised keys.
+- **High-risk actions**: asset mint (creates the asset + activates on-chain), governed custody transfer, and other irreversible operations.
+- **Replay protection + execute-once**: a proposal executes exactly once — re-execution reverts (contract state machine), and API state guards return deterministic 412s on invalid transitions (verified live: replay of mint.execute → 412).
+- Governed mint execution anchors the asset on-chain **and activates it** in the same flow (post-execute `setAssetStatus(ACTIVATE)`, audited; failure records `BLOCKCHAIN_TRANSACTION_FAILED`).
+
+---
+
+## Asset Lifecycle
+
+```
+Create/request (manager; classification set server-side)
+   → approval (maker-checker / governed as policy requires)
+   → mint (governance: request → multisig approve → timelock → execute; asset row created, NFT minted)
+   → on-chain activation (setAssetStatus ACTIVATE post-execute, audited)
+   → assignment (custodian assignment, both identities ACTIVE on-chain)
+   → controlled transfer (governed: request → recipient accept → admin approve → execute;
+                          or guarded transferCustody() with step-up where policy requires)
+   → provenance/audit (every step: application audit event + on-chain event + indexer projection)
+```
+
+Content lifecycle rides alongside: encrypted versions (V1, V2, …) are added under the same authorization policy; each version gets its own CID, key, and integrity hash; grants authorize per-version decryption.
+
+---
+
+## Testing
+
+All numbers below were re-run and confirmed passing on this commit (dev :3000 and production build :8321):
+
+| Suite                                                       | Result     | Command                                                                    |
+| ----------------------------------------------------------- | ---------- | -------------------------------------------------------------------------- |
+| Unit/integration (Vitest)                                   | **548/548** (40 files) | `pnpm test`                                                    |
+| Adversarial security matrix (live)                          | **63/63**  | `node --env-file=.env server/verify-adversarial.mjs`                        |
+| DID hardening (live: challenge/replay/step-up/rotation)     | ALL PASS   | `node --env-file=.env server/verify-did-hardening.mjs`                      |
+| Governance lifecycle (live: maker-checker, state guards)    | **19/19**  | `node --env-file=.env server/verify-governance.mjs`                          |
+| IPFS evidence (live Kubo: ciphertext-only, tamper, fail-closed) | **22/22** | `pnpm exec tsx --env-file=.env scripts/verify-ipfs-evidence.mts`         |
+| Asset E2E (mint→activate→content→transfer, dev **and** prod) | ALL PASS  | `node --env-file=.env server/verify-asset-e2e.mjs [base-url]`               |
+| Session isolation (browser, 2 contexts)                     | **13/13**  | `python scripts/e2e-session-isolation.py`                                   |
+| Browser E2E (real UI logins, no console errors)             | **18/18**  | `python scripts/e2e-browser.py`                                             |
+| Acceptance flow (dev **and** prod)                          | ALL PASS   | `pnpm run verify:acceptance`                                                 |
+| Security live checks (DID/step-up binding, graph/provenance) | ALL PASS  | `node --env-file=.env server/verify-security.mjs`                            |
+| Fresh-DB migrations (true cold-start proof)                 | **18/18**  | `FRESH_DATABASE_URL=… node scripts/verify-migrations.mjs`                    |
+| Production dry run (build→start→health→SIGTERM)             | **PASS**   | `bash scripts/ops/prod-dryrun.sh`                                            |
+| Dependency audit (prod)                                     | clean      | `pnpm audit --prod` → no known vulnerabilities                              |
+| Typecheck                                                   | clean      | `pnpm run check`                                                             |
+
+What the live suites prove: Kubo is actually reachable and stores **only ciphertext** (plaintext marker absent in raw Kubo bytes; byte-exact authorized decryption; tampered/invalid CID retrieval fails; Kubo-down fails closed); blockchain transactions confirm with real receipts (transfer tx + custody sync); the indexer projects events into the read model; browser sessions are isolated with no JWT in JS-visible storage and no console errors.
+
+---
+
+## Deployment
+
+The application runs on **Railway** or **Render** (configs ship in-repo: `railway.json`, `render.yaml`, `Dockerfile`, `docker-compose.production.yml`).
+
+**Required external dependencies (operator-provisioned, not hosted by Railway/Render):**
+
+- **MySQL 8.x** — Railway MySQL plugin or an external MySQL host (Render Postgres is NOT compatible).
+- **Besu/QBFT RPC** — a reachable JSON-RPC endpoint of your permissioned network.
+- **Self-hosted Kubo** — your own IPFS node, reachable at `IPFS_API_URL` (operator-controlled infrastructure).
+- **Graph infrastructure** — optional; the app queries Besu RPC directly without it.
+
+**Required environment variables** (all documented in `.env.example`):
+
+| Variable                  | Required      | Purpose                                                                    |
+| ------------------------- | ------------- | -------------------------------------------------------------------------- |
+| `DATABASE_URL`            | yes (prod)    | MySQL connection string (`mysql://…`)                                       |
+| `JWT_SECRET`              | yes (prod)    | Session signing secret, ≥ 32 random chars; startup fails closed without it   |
+| `VITE_APP_ID`             | yes (prod)    | Binds session tokens to this deployment                                     |
+| `ASSET_CONTENT_MASTER_KEY`| yes (prod)    | 64 hex chars (32 bytes) AES-256-GCM master key wrapping per-object data keys |
+| `IPFS_API_URL`            | yes (prod)    | Self-hosted Kubo RPC API; production refuses to start without it            |
+| `APP_URL`                 | recommended   | Public origin of the deployment                                             |
+| `TRUST_PROXY`             | behind proxy  | `1` only when a real reverse proxy fronts the app                           |
+| `BLOCKCHAIN_RPC_URL`      | for chain     | Besu JSON-RPC endpoint                                                      |
+| `BLOCKCHAIN_CHAIN_ID`     | for chain     | Expected chain ID (default `4224`); mismatch refuses to bind                |
+| `BLOCKCHAIN_PRIVATE_KEY`  | for chain     | Operator signing key (the tutorial demo key is refused in production)       |
+| `PORT`                    | auto (Railway/Render) | The platform injects it; production refuses to hop ports            |
+
+Production startup is **fail-closed** on missing `DATABASE_URL`/`JWT_SECRET`/`VITE_APP_ID`/`ASSET_CONTENT_MASTER_KEY`/`IPFS_API_URL`. Check effective config with `pnpm run check:env` (secrets redacted).
+
+### Docker (self-managed)
+
+```bash
+docker compose -f docker-compose.production.yml up -d --build
+docker compose -f docker-compose.production.yml exec app pnpm drizzle-kit migrate
+curl -f http://localhost:3000/health && curl -f http://localhost:3000/ready
 ```
 
 ---
 
 ## Local Development
 
-### Prerequisites
-
-- **Node.js 22** and **pnpm 10** (`corepack enable`)
-- **Docker** with Docker Compose v2 (for the Besu network and MySQL)
-- A MySQL 8.4 instance reachable for the app (local container or otherwise)
-
-### Install
-
 ```bash
-pnpm install --frozen-lockfile
+corepack enable && pnpm install --frozen-lockfile   # install
+cp .env.example .env                                 # then fill values
+
+pnpm run check            # typecheck (tsc --noEmit)
+pnpm test                 # unit/integration suite
+pnpm run contracts:compile  # solc → blockchain/artifacts
+pnpm run blockchain:start   # 4-validator Besu QBFT network (docker)
+pnpm run blockchain:deploy  # deploy contracts + roles → blockchain/deployment.json
+pnpm run db:push            # drizzle migrations
+pnpm run seed:demo          # demo users/identities/assets
+
+pnpm run dev              # dev server → http://localhost:3000
+
+pnpm run build            # vite build + esbuild server → dist/
+pnpm run start            # production start (NODE_ENV=production)
+pnpm run start:migrate    # apply migrations from the production bundle
 ```
 
-### Environment
+Health / readiness / verification:
 
 ```bash
-cp .env.example .env
-# Fill in the values (see Environment Variables below)
+curl -f http://localhost:3000/health     # liveness
+curl -f http://localhost:3000/ready      # readiness (schema + kubo + chain)
+pnpm run health:smoke                    # smoke check
+pnpm exec tsx --env-file=.env scripts/verify-ipfs-evidence.mts   # IPFS verification
+node --env-file=.env server/verify-asset-e2e.mjs                  # asset E2E (real chain+DB)
+node --env-file=.env server/verify-asset-e2e.mjs http://127.0.0.1:8321  # against the production build
 ```
 
-### Database
+Demo logins (seeded by `pnpm run seed:demo`): `admin@sampraan.dev`, `manager@sampraan.dev`, `auditor@sampraan.dev`, `user@sampraan.dev` — passwords printed by the seed script.
 
-Create a MySQL database and set `DATABASE_URL`, then apply the schema:
+---
 
-```bash
-pnpm run db:push        # drizzle-kit generate && drizzle-kit migrate
-```
+## Production Verification
 
-Optionally seed fictional demo data (roles, permissions, identities, one asset, one alert):
+- **`GET /health`** — public liveness: process, DB connection, chain status (bounded 5s RPC timeout), crypto-assurance posture, and which integrations are configured. Never leaks secrets.
+- **`GET /ready`** — readiness: `503` until the database connects **and the schema is migrated** (`schema: MIGRATED`); additionally reports a live Kubo round-trip (`kubo.reachable` + a real CID from an add→cat probe) and chain status. Used by the compose healthcheck and load-balancer gating. Verified output on this commit:
 
-```bash
-pnpm run seed:demo
-```
-
-### Blockchain (local permissioned network)
-
-```bash
-pnpm run blockchain:start    # 4 Besu QBFT validators, RPC on http://localhost:8545
-pnpm run contracts:compile   # solc 0.8.30 → blockchain/artifacts/*.json
-pnpm run blockchain:deploy   # deploys contracts, grants roles, writes blockchain/deployment.json
-pnpm run blockchain:stop     # stop the network
-```
-
-> The deploy script falls back to a publicly documented Besu tutorial genesis key **only on the local demo chain** and refuses that key under `NODE_ENV=production`. Set `BLOCKCHAIN_PRIVATE_KEY` for any real deployment.
-
-### Run
-
-```bash
-pnpm run dev        # dev server with Vite HMR — http://localhost:3000
-```
-
-Production build / start:
-
-```bash
-pnpm run build      # vite build (client) + esbuild (server) → dist/
-pnpm run start      # NODE_ENV=production node dist/index.js
-```
-
-Other scripts: `pnpm run check` (tsc --noEmit), `pnpm run format` (Prettier), `pnpm test` (Vitest).
-
-### Frontend access
-
-Open **http://localhost:3000**. Unauthenticated visitors see the landing page and a workspace demo mode; signing in via the OAuth gate (`VITE_OAUTH_PORTAL_URL` configured) enters the live workspace. Local demo sessions can be minted with `node scripts/provision-admin.mjs` / `provision-user.mjs` (dev-only helpers).
-
-### Multi-user demo sessions (SIH presentation)
-
-The session is an HttpOnly `app_session_id` cookie scoped to the browser **profile** — every tab of the same profile shares it, and the server always resolves identity/role from that cookie server-side. Consequences for the demo:
-
-- Logging in as a second user **in another tab of the same profile** replaces the shared session: every tab then re-resolves to the new user (this is standard cookie behavior, not a defect, and it can never grant privileges — the server decides).
-- To present **four simultaneous, isolated users** (ADMIN / MANAGER / AUDITOR / USER), run each login in a separate browser context — one of:
-  - Chrome/Edge **profiles** (top-right profile switcher), or
-  - a normal window + separate **InPrivate/Incognito** windows, or
-  - Chrome **user-data-dir** shortcuts per role.
-
-Each context keeps its own real login/session; actions never cross contexts, and logging out in one does not affect the others.
-
-Recommended flow:
-
-```bash
-pnpm run seed:demo      # prints the four demo logins
-pnpm run dev            # http://localhost:3000
-# then: profile-1 → admin login · profile-2 → manager · profile-3 → auditor · profile-4 → user
+```json
+{"ready":true,"database":"CONNECTED","schema":"MIGRATED",
+ "kubo":{"configured":true,"reachable":true,"cid":"bafkrei…"},
+ "blockchain":{"connected":true,"mode":"BESU","chainId":4224,"latestBlock":120160,…}}
 ```
 
 ---
 
-## Environment Variables
+## Known External Dependencies
 
-From `.env.example`, `docker-compose.production.yml`, and `docs/operations.md`:
+**IMPLEMENTED AND VERIFIED** (all evidence above was executed on this commit, against a real 4-validator Besu QBFT chain, MySQL 8.4, and a self-hosted Kubo node):
 
-| Variable                                     | Required                        | Purpose                                                                                     |
-| -------------------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`                               | yes                             | MySQL connection string, e.g. `mysql://user:pass@localhost:3306/sampraan`                   |
-| `JWT_SECRET`                                 | yes (prod)                      | Session signing secret — **≥ 32 random chars**; production refuses to boot without it       |
-| `VITE_APP_ID`                                | yes (prod)                      | Binds session tokens to this app; foreign-app tokens are rejected                           |
-| `OAUTH_SERVER_URL`                           | prod                            | Identity provider base URL for token exchange                                               |
-| `OWNER_OPEN_ID`                              | optional                        | Platform user that receives the admin role at first login                                   |
-| `VITE_OAUTH_PORTAL_URL`                      | optional (client)               | OAuth portal URL used by the sign-in button                                                 |
-| `BLOCKCHAIN_RPC_URL`                         | default `http://localhost:8545` | Besu JSON-RPC endpoint                                                                      |
-| `BLOCKCHAIN_CHAIN_ID`                        | default `4224`                  | Expected chain ID; a mismatch refuses to bind contracts                                     |
-| `BLOCKCHAIN_PRIVATE_KEY`                     | for BESU mode                   | Operator signing key — **never commit a real key**                                          |
-| `BLOCKCHAIN_IDENTITY_CONTRACT_ADDRESS`       | optional                        | Override identity registry address (defaults to `blockchain/deployment.json`)               |
-| `BLOCKCHAIN_ASSET_CONTRACT_ADDRESS`          | optional                        | Override asset registry address                                                             |
-| `BLOCKCHAIN_ACCESS_CONTROL_CONTRACT_ADDRESS` | optional                        | Override access control address                                                             |
-| `CORS_ORIGIN`                                | prod                            | Comma-separated allowlist; **unset = fail closed** (no cross-origin headers emitted)        |
-| `TRUST_PROXY`                                | behind proxy                    | `1` to key rate limits on `X-Forwarded-For` — set **only** when a real proxy fronts the app |
-| `PORT`                                       | default `3000`                  | Production refuses to hop to another port                                                   |
-| `MYSQL_ROOT_PASSWORD` `MYSQL_PASSWORD`       | compose (required)              | MySQL credentials for the production compose stack                                          |
-| `MYSQL_USER` `MYSQL_DATABASE`                | compose (default `sampraan`)    | MySQL user/database                                                                         |
-| `APP_PORT`                                   | compose (default `3000`)        | Host port published for the app container                                                   |
+- Full asset lifecycle: maker-checker mint → on-chain activation → assignment → governed transfer → provenance.
+- AES-256-GCM encrypted content on self-hosted Kubo (ciphertext-only evidence, tamper detection, fail-closed when Kubo is down).
+- DID lifecycle + key rotation/revocation + replay-protected step-up (ECDSA baseline + ML-DSA-65 registered-only policy).
+- RBAC/ABAC policy engine, deterministic risk scoring, maker-checker governance with multisig quorum + timelock + execute-once.
+- Event indexer, audit/provenance, session isolation and revocation.
+- Migrations (fresh cold-start proof), production build/start/health/readiness, graceful SIGTERM.
 
-**Secrets policy:** never commit `.env`, private keys, or tokens. Use placeholders when documenting:
+**REQUIRES OPERATOR CONFIGURATION** (code ready, values must be supplied by the operator):
 
-```
-JWT_SECRET=<generate-a-strong-random-secret>
-BLOCKCHAIN_PRIVATE_KEY=<your-operator-key>
-```
+- Production secrets: `JWT_SECRET`, `ASSET_CONTENT_MASTER_KEY`, `BLOCKCHAIN_PRIVATE_KEY` (real operator key with chain roles), MySQL credentials.
+- Production `IPFS_API_URL` pointing at an operator-controlled Kubo node; production Besu RPC for the permissioned chain.
+- Railway/Render project setup (MySQL plugin / external MySQL, env vars) and HTTPS termination in front of the app.
+- Optional: OAuth2 identity provider (`OAUTH_SERVER_URL`) for enterprise IdP login; graph-node deployment for the subgraph query layer.
 
----
+**NOT VERIFIED DUE TO EXTERNAL CREDENTIALS:**
 
-## Production Deployment
-
-The repository ships a complete production path. Full detail in [`docs/operations.md`](docs/operations.md).
-
-### Topology
-
-| Component                      | Managed by                                                               | Lifecycle                                             |
-| ------------------------------ | ------------------------------------------------------------------------ | ----------------------------------------------------- |
-| Besu QBFT chain (4 validators) | `blockchain/network/docker-compose.yml`                                  | infrastructure — independent of app deploys           |
-| MySQL 8.4                      | `docker-compose.production.yml`                                          | app-adjacent, persistent volume `sampraan-mysql-data` |
-| Application                    | `docker-compose.production.yml` (`Dockerfile`, non-root user `sampraan`) | immutable image per build                             |
-
-The application container is **stateless**; durable state lives in MySQL and on-chain.
-
-### Cold start (from `docs/operations.md`)
-
-```bash
-# 0. Prerequisites: Docker, docker compose v2, pnpm 10, Node 22.
-cp .env.example .env        # fill REAL secrets
-
-# 1. Bring up the QBFT validator network.
-pnpm run blockchain:start
-
-# 2. Deploy the smart contracts with a REAL operator key.
-BLOCKCHAIN_PRIVATE_KEY=<operator-key> pnpm run blockchain:deploy
-
-# 3. Build and start the app + MySQL.
-docker compose -f docker-compose.production.yml up -d --build
-
-# 4. Apply the database schema.
-docker compose -f docker-compose.production.yml exec app pnpm drizzle-kit migrate
-
-# 5. Verify.
-curl -f http://localhost:3000/health
-curl -f http://localhost:3000/ready
-```
-
-### Health / readiness
-
-- `GET /health` — public liveness: process, DB configured/connected, chain status (bounded 5s RPC timeout so a hung chain cannot stall the probe).
-- `GET /ready` — readiness: **503 until the DB connects**; used by the compose healthcheck (every 30s) and load-balancer gating. Chain status is reported but deliberately does not gate readiness (anchoring is best-effort by design).
-
-### Provided vs. operator-provisioned
-
-**Provided by the repository:** application image (multi-stage, non-root, healthchecked), MySQL service with healthcheck and backup config, the QBFT validator network definition, migrations, backup/restore/rollback scripts, fail-closed startup validation.
-
-**Operator must provision externally:** a real operator key (`BLOCKCHAIN_PRIVATE_KEY`) with funded balance and chain roles, an identity provider (`OAUTH_SERVER_URL`) or an equivalent auth source, real secrets (`JWT_SECRET`, MySQL passwords), and — for internet-facing deployments — **HTTPS termination via a reverse proxy** (the app sets HSTS and secure cookies when it sees `x-forwarded-proto: https`; set `TRUST_PROXY=1` in that topology). Validator key rotation and monitoring/alerting infrastructure are also operator responsibilities.
-
-### Backup / restore / rollback
-
-```bash
-./scripts/ops/backup.sh                                   # MySQL dump + deployment manifest + sha256 manifest
-./scripts/ops/restore.sh backups/sampraan-mysql-<ts>.sql.gz       # refuses an occupied DB without --force
-./scripts/ops/rollback-app.sh sampraan-app:<previous-tag>  # redeploys the previous image, waits for /ready
-```
-
-Policies (documented in `docs/operations.md`): take a backup **before every deploy and migration**; drizzle migrations are **append-only** (no `migrate down`) — a destructive migration is handled by restoring the pre-deploy backup; contract rollback **does not exist by design** — regressions are handled by deploying new addresses, which supersedes but never rewrites the old evidence trail. Besu chain state is intentionally outside the app backup; validator volumes are snapshotted separately (all four from the same point in time).
-
----
-
-## Security Model
-
-Properties **verified in the code and tests**:
-
-- **Server-side authorization** — role, permissions, identity status, and asset classification are resolved from the session and the database; client-asserted values are never trusted (`routers.security.test.ts` proves classification/step-up/role assertions cannot influence a decision).
-- **Smart-contract authorization** — the contract re-verifies role, actor identity status, and asset state on every protected transition; it never trusts the backend's decision (see next section).
-- **Session revocation** — sessions are tracked server-side on login; logout revokes both cookie and Bearer channels; a revoked row rejects the very next request, before JWT expiry.
-- **Secure cookies** — `httpOnly`, `SameSite=Lax`, `secure` under HTTPS/proxy; the OAuth state cookie is a one-time `__Host-` prefixed nonce.
-- **CORS fails closed** — no `CORS_ORIGIN`, no cross-origin response is blessed.
-- **CSP** — `default-src 'self'`; scripts locked to `'self'` in production; `object-src 'none'`; `base-uri`/`form-action` `'self'`.
-- **HSTS** — `max-age=31536000; includeSubDomains` in production or over TLS.
-- **Rate limiting** — 120 req/min per IP, memory-bounded (max 10k keys, swept buckets) so it cannot be a memory-exhaustion vector; 429 with `Retry-After`.
-- **Body-size limits** — JSON and URL-encoded bodies capped at 1 MB.
-- **Production secret validation** — startup fails closed on a missing/short `JWT_SECRET` or missing `VITE_APP_ID`; production refuses to bind a different port.
-- **Chain ID verification** — the Besu adapter refuses to bind contracts when the RPC's chain ID does not match `BLOCKCHAIN_CHAIN_ID`.
-- **Deployment-key protections** — the deploy script refuses the demo genesis key under `NODE_ENV=production`; validator node keys are gitignored (removed from tracking in `de67231`).
-- **Non-root container** — the runtime image runs as user `sampraan`, prod-only dependencies, no build toolchain, no source, no secrets baked in.
-- **Error masking** — unexpected tRPC internals are replaced with a generic message after server-side logging; `x-powered-by` disabled.
-- **Dependency audits** — `pnpm audit --prod` reports **no known production vulnerabilities** at this commit. (The full audit including devDependencies currently reports transitive advisories — e.g. `tar` via `@tailwindcss/oxide` and `tmp` via `solc` — which do not ship in the production image.)
-
-No security claim here is absolute: this is a hardened release candidate, not a formally audited product.
-
----
-
-## Smart-Contract Authorization (the SIH minimum demo flow)
-
-Authorization is **not** enforced by hiding UI controls. The frontend can only _name_ an asset; role, permissions, classification, and identity status always come from the server session and the database, and the smart contract re-verifies everything independently.
-
-On-chain checks in `SampraanAssetRegistry.transferCustody()`:
-
-- caller holds `ASSET_MANAGER_ROLE` (else `NotAssetManager`/`NotAuthorizedOperator`)
-- asset is registered and `ACTIVE` — suspended/revoked assets are frozen (`AssetNotActive`)
-- current custodian identity is still `ACTIVE` (`CustodianNotActive`)
-- recipient identity is registered and `ACTIVE` (`RecipientNotActive`)
-- zero-address and same-custodian guards
-
-`SampraanIdentityRegistry` gates every identity mutation behind `IDENTITY_ADMIN_ROLE`, and `SampraanAccessControl` protects role grants behind `DEFAULT_ADMIN_ROLE`.
-
-### The demo flow (verified by live-chain tests)
-
-**Auditor path — rejected:**
-
-```
-Auditor attempts the transfer
-  → backend policy engine: role/permission check
-  → if submitted: smart contract rejects (caller lacks ASSET_MANAGER_ROLE)
-  → ownership/custody remains unchanged — no transaction is mined
-  → denial recorded as an audit event (AUTHORIZATION_DENIED)
-```
-
-**Manager path — accepted:**
-
-```
-Manager (with asset:transfer permission) attempts the same transfer
-  → backend policy engine: ALLOW (decision + audit rows persisted)
-  → real blockchain transaction submitted to Besu QBFT
-  → AssetTransferred event emitted; transaction confirmed (receipt awaited)
-  → audit event updated with transactionHash + blockNumber + blockHash evidence
-  → indexer projects the event into the read model; DB custodian updated
-```
-
-Test coverage confirming this behavior (against the live QBFT chain, `besu-contracts.test.ts`): _unauthorized caller cannot transfer custody_, _auditor (no mutation role) cannot mint assets_, _unauthorized mint reverts_, _revoked asset is frozen permanently_, _identity revocation works and blocks protected operations_.
-
----
-
-## Auditability
-
-- **On-chain (immutable evidence):** every protected state transition — identity registration/status change, asset mint/assign/transfer/status change, role grants/revokes — emits an event carrying only digests and addresses. QBFT gives immediate finality (no reorgs), so confirmed evidence cannot be rewritten. Transaction receipts are retrievable by hash.
-- **Off-chain (read model):** `audit_events` stores application decisions (authorization allows/denies/challenges, admin lifecycle actions, anchor outcomes, chain failures) with actor attribution resolved server-side, plus chain-derived rows (`source = CHAIN_READ_MODEL`) projected by the indexer. The audit API distinguishes application decisions from on-chain projections, and rows carry `transactionHash`/`blockNumber` when a real chain confirmed the operation.
-
-The read model can be rebuilt from the chain; the chain is the evidence of record.
-
----
-
-## Privacy / Data Handling
-
-SAMPRAAN stores **only keccak256 digests and wallet addresses on-chain**:
-
-- Identities: the DID string itself stays off-chain (`did_records`); the chain holds only `keccak256(DID)`, a public-key digest, and a lifecycle status.
-- Assets: only digests of the asset ID, classification, and a metadata/integrity reference. Document contents, firmware binaries, and metadata stay off-chain.
-- Events: digests and addresses only — never PII, private keys, or sensitive content.
-
-This is a **permissioned** network: four known QBFT validators under deterministic configuration, no public access, no token economics. Sensitive employee/PII data should never be placed directly on a blockchain — public or permissioned — and this design deliberately keeps it off-chain with only integrity anchors on-chain.
-
----
-
-## Testing
-
-```bash
-pnpm test          # full suite (Vitest)
-```
-
-Current verified state at the release candidate: **28 test files, 398 tests, all passing** — including 13 live Besu QBFT smart-contract tests. Live-chain tests deploy their own contract suite and self-skip when the chain is unreachable, so `pnpm test` also passes in CI without Docker.
-
-| Category                    | Files                                                                                                                                             | Coverage                                                                                                                             |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Unit                        | `authorization.service`, `trust-domain`, `security`, `cookies`, `error-handler`, `sampraan` (client helpers), `db-errors`, `paths`, `besu-config` | Policy engine, CORS/headers/rate-limit, cookie policy, display helpers, no-DB degradation                                            |
-| Session/auth                | `sdk`, `sdk.session`, `oauth`, `auth.logout`, `auth.session-tracking`, `audit.attribution`                                                        | JWT sign/verify, appId binding, foreign secret, tamper/expiry/garbage, CSRF nonce, revocation, actor attribution                     || Integration (tRPC)          | `routers.test`, `routers.security.test`, `regression.bugfix`, `db.test`                                                                           | Full procedure paths with the DB layer mocked: client-bypass attempts, step-up behavior, custody read-model sync, duplicate handling |
-| Audit hardening             | `audit-hardening`                                                                                                                                 | PORT misconfiguration refusal, login throttle, zero-key refusal, scrypt memory guard, MOCK-mode fail-closed transfers, approval→recipient binding, DID key IDOR, indexer checkpoint resume, login-failure intelligence rule |
-| Blockchain adapter          | `besu-adapter`, `blockchain.service`, `status-timeout`                                                                                            | Provider connection, submission, receipt parsing, hung-RPC degradation, single-signer nonce discipline |
-| E2E (local, optional)       | `scripts/frontend-verify.py`, `scripts/ui-flow-a.py`                                                                                              | Playwright-driven UI proofs of the transfer flow and custody state — run manually, not part of `pnpm test`                           |
-
-Also run: `pnpm run check` (typecheck), `pnpm run build`, `pnpm run contracts:compile`.
-
-### Live end-to-end verification (real chain + real DB)
-
-With MySQL and the Besu network running (`pnpm run blockchain:start`):
-
-```bash
-pnpm run verify:acceptance              # full SIH flow: 4 logins → create → mint → assign → transfer → denials → audit evidence
-node server/verify-security.mjs         # DID challenge/replay, step-up binding, policy simulator, graph/provenance
-node scripts/verify-session-isolation.mjs  # four PARALLEL sessions stay isolated (cookies, roles, logout)
-```
-
-All three must report every check PASS before a presentation.
-
----
-
-## Demo Guide (SIH evaluation)
-
-Prerequisites: the Besu network running, contracts deployed, database migrated + seeded, and demo sessions provisioned (`node scripts/provision-admin.mjs`, `node scripts/provision-user.mjs <openId> <did>`).
-
-1. **Login as the Auditor** (a user linked to an identity with no mutation role/permission).
-2. Open **Access Control** and select the sensitive asset.
-3. Click **EVALUATE VIA BACKEND** to attempt the transfer.
-4. Show the **rejection** — the policy engine DENIES (the Auditor identity holds no mutating permission), the panel reads DENIED / OFF CHAIN, custody is unchanged, no transaction is mined, and an `AUTHORIZATION_DENIED` audit row appears. (The contract-level check is additionally proven by the live-chain tests: _unauthorized caller cannot transfer custody_, _auditor cannot mint assets_ — both revert in `SampraanAssetRegistry` itself.)
-5. **Login as the Manager** (identity holding `asset:transfer`).
-6. Transfer the **same asset** — the policy engine returns ALLOW (a MANAGER identity holding `asset:transfer` on a non-`HIGHLY_SENSITIVE` asset; on the seeded `HIGHLY_SENSITIVE` asset the engine returns `CHALLENGE` for every role because no server-verified step-up exists — see [Limitations](#limitations--production-notes)).
-7. Show the successful **Besu transaction** — real `transactionHash` and block number in the CHAIN ANCHOR panel.
-8. Show the **transaction/block/event evidence** — the receipt, the `AssetTransferred` event, and the indexed read-model row in Audit Evidence.
-9. Show the **audit trail update** — decision, evidence row, and updated custodian in the asset registry.
-10. Optionally demonstrate **identity revocation**: an admin suspends/revokes an identity in the Identity page; its session is rejected on the next request and the lifecycle change is anchored on-chain.
-
-If the acting identity already holds on-chain custody, the UI reports **ALREADY IN CUSTODY — NO TRANSFER NEEDED** rather than an error (an honest, evidence-backed result). No browser-console JWT injection, fake transaction hashes, or demo-only bypasses are used in the normal flow — every step above goes through the real backend and the real chain.
+- A hosted **Railway/Render deployment** has not been executed — the configs are validated locally (dry run PASS) but "deployed on Railway/Render" is **not** claimed.
+- Live enterprise IdP (OAuth2) login with a real external IdP.
+- Graph-node subgraph deployment on external infrastructure (local graph-node stack runs; the app works without it).
 
 ---
 
 ## Limitations / Production Notes
 
-Honest disclosure of what the release candidate does **not** do:
-
-- **No server-verified step-up authentication.** The policy engine returns `CHALLENGE` (POLICY-STEP-UP) for highly sensitive transfers for **every role, including admin**, because no server-verified step-up mechanism exists; a client-asserted flag is never trusted (`docs/integration-notes.md`).
-- **Rate limiting is in-process memory.** Behind multiple replicas each node keeps its own buckets; keys are per-IP (`TRUST_PROXY=1` required behind a proxy, which must be set only when a real proxy fronts the app).
-- **Indexer lag.** Chain events reach the audit read model on a 30s schedule (evidence itself is immediate on-chain).
-- **Anchoring is best-effort at creation time** by design — a chain outage never blocks identity/asset creation; failed anchors surface as `BLOCKCHAIN_ANCHOR_FAILED` events for re-run.
-- **Seed data does not link identities to platform users** (`identities.linkedUserId`), so a freshly seeded database denies transfers (fail-closed) until an operator links them — the deliberate, documented default (`docs/integration-notes.md`).
-- **Authorization decision `policyId` is stored as null** for inline policy labels (they are not UUIDs and the column is FK-bound); labels are preserved in audit metadata instead.
-- **Live OAuth E2E was not verifiable in the development environment** (no external IdP credentials); the session/verification layer is covered by unit tests and the live path is documented as unverified.
-- **Contracts are deliberately non-upgradeable** (no proxies) — simpler attack surface, deterministic behavior; a regression means deploying new addresses.
-- **DevDependency audit findings** exist (transitive `tar`, `tmp`, etc.); they are excluded from the production image but are not yet patched at the devDependency level.
-- **No formal security audit** has been performed on this codebase.
-
----
-
-## Roadmap (future work — not implemented)
-
-- Server-side step-up authentication for highly sensitive assets (closing the POLICY-STEP-UP CHALLENGE gap).
-- External OAuth/enterprise IdP configuration guidance and verification.
-- HSM-backed key management for the operator and validator keys.
-- Horizontally shared rate limiting (e.g. Redis-backed) for multi-replica deployments.
-- IoT/device identity and custody attestation.
-- Physical asset verification / oracle integration for chain-anchored attestations.
-
----
+- No formal third-party security audit has been performed.
+- Rate limiting is in-process memory (per-replica buckets); use a shared limiter for multi-replica scale-out.
+- Indexer lag: chain events reach the read model on a 30s schedule (on-chain evidence itself is immediate).
+- Anchoring is best-effort at creation time by design; failures surface as `BLOCKCHAIN_ANCHOR_FAILED` audit events.
+- DevDependency-level audit advisories exist (transitive, not shipped in the production image); `pnpm audit --prod` is clean.
+- Contracts are deliberately non-upgradeable (no proxies); a regression means deploying new addresses.
 
 ## License
 
-No license file is currently committed to this repository; `package.json` declares `"license": "MIT"`, but the repo carries no `LICENSE` text. Licensing should be considered **not yet formally specified** until a license file is added.
-
----
-
-## Contributing / Development Notes
-
-- The repository is a pnpm workspace — always install with `pnpm install --frozen-lockfile`.
-- Patches (`patches/wouter@3.7.1.patch`) and security overrides live in `pnpm-workspace.yaml` (pnpm 10 reads them there, not from `package.json`).
-- Keep drizzle migrations append-only; write compensating migrations rather than editing history.
-- Run `pnpm run check`, `pnpm test`, and `pnpm run contracts:compile` before proposing changes.
-- No branch/PR policy is documented in the repository; coordinate with the team before opening PRs against `main`.
+`package.json` declares `MIT`; no LICENSE file is committed.

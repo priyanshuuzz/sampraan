@@ -52,6 +52,8 @@ import {
   createStepUpChallenge,
   verifyStepUpChallenge,
   hasValidStepUp,
+  resolveDidDocument,
+  listDidKeyHistory,
   fingerprintNonce,
 } from "./modules/did/did-auth.service";
 import { buildAssetProvenance } from "./modules/provenance/provenance.service";
@@ -66,6 +68,10 @@ import {
   securityIntelligenceService,
 } from "./modules/security-intelligence/intelligence.service";
 import { parse as parseCookieHeader } from "cookie";
+import { assetContentRouter } from "./modules/asset-content/asset-content.router";
+import { stepUpPurposeFor } from "./modules/asset-content/asset-content.router";
+import { governanceRouter } from "./modules/governance/governance.router";
+import { assuranceRouter } from "./modules/crypto-assurance/assurance.router";
 
 /** Extract the session token from a raw Cookie header (null when absent). */
 function extractSessionCookie(cookieHeader: unknown): string | null {
@@ -92,6 +98,12 @@ const did = z
 export const appRouter = router({
   system: systemRouter,
   /**
+   * Controlled asset CONTENT (versions, encrypted storage, integrity) —
+   * every procedure authorizes server-side through evaluateContentAccess.
+   * There is deliberately NO download procedure and NO public file URL.
+   */
+  content: assetContentRouter,
+  /**
    * DID authentication (LOOP 2) + key lifecycle (LOOP 3).
    * Challenge-response: server issues a single-use expiring nonce bound to
    * the DID; the caller signs it with the DID key; the server verifies the
@@ -100,18 +112,21 @@ export const appRouter = router({
    */
   did: router({
     requestChallenge: publicProcedure
-      .input(z.object({ did: z.string().min(8).max(255) }))
+      // FINAL-AUDIT FIX (input parity): the DID format regex (already enforced
+      // on identities.create) now guards EVERY did-router input, so malformed
+      // identifiers fail validation (400) instead of reaching the service layer.
+      .input(z.object({ did }))
       .mutation(async ({ input }) => {
         const result = await createDidChallenge(input.did.trim());
         if (!result.ok) {
           await createAuditEvent({ actorIdentityId: null, action: "DID_CHALLENGE_REQUESTED", resourceType: "IDENTITY", resourceId: input.did, decision: "DENY", reason: result.reason, metadata: { source: "did-auth", code: result.code } }).catch(() => undefined);
           throw new TRPCError({ code: result.code === "DID_NOT_FOUND" ? "NOT_FOUND" : "FORBIDDEN", message: result.reason });
         }
-        await createAuditEvent({ actorIdentityId: null, action: "DID_CHALLENGE_REQUESTED", resourceType: "IDENTITY", resourceId: input.did, decision: "ALLOW", reason: "Challenge issued", metadata: { source: "did-auth", nonceFingerprint: fingerprintNonce(result.challenge.nonce), expiresAt: result.challenge.expiresAt } }).catch(() => undefined);
+        await createAuditEvent({ actorIdentityId: null, action: "DID_CHALLENGE_REQUESTED", resourceType: "IDENTITY", resourceId: input.did, decision: "ALLOW", reason: "Challenge issued", metadata: { source: "did-auth", nonceFingerprint: fingerprintNonce(result.challenge.nonce), expiresAt: result.challenge.expiresAt, purpose: result.challenge.purpose, keyIdentifier: result.challenge.keyIdentifier } }).catch(() => undefined);
         return result.challenge;
       }),
     verifyChallenge: publicProcedure
-      .input(z.object({ did: z.string().min(8).max(255), nonce: z.string().min(16).max(128), signature: z.string().min(32).max(255) }))
+      .input(z.object({ did, nonce: z.string().min(16).max(128), signature: z.string().min(32).max(255) }))
       .mutation(async ({ input }) => {
         const operatorKey = besuBlockchainService?.config.privateKey ?? null;
         if (!operatorKey) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Blockchain operator key is not configured — DID verification unavailable" });
@@ -140,8 +155,8 @@ export const appRouter = router({
           }
         }
         const identity = await getIdentityById(result.identityId);
-        await createAuditEvent({ actorIdentityId: result.identityId, action: "DID_AUTH_SUCCEEDED", resourceType: "IDENTITY", resourceId: result.did, decision: "ALLOW", reason: "Challenge signature verified against the DID reference wallet", metadata: { source: "did-auth", recoveredAddress: result.recoveredAddress, sessionIssued: Boolean(sessionToken) } }).catch(() => undefined);
-        return { ok: true as const, identityId: result.identityId, did: result.did, displayName: identity?.displayName ?? null, identityStatus: identity?.status ?? null, sessionToken };
+        await createAuditEvent({ actorIdentityId: result.identityId, action: "DID_AUTH_SUCCEEDED", resourceType: "IDENTITY", resourceId: result.did, decision: "ALLOW", reason: "Structured challenge signature verified against the DID reference wallet", metadata: { source: "did-auth", recoveredAddress: result.recoveredAddress, keyIdentifier: result.keyIdentifier, sessionIssued: Boolean(sessionToken) } }).catch(() => undefined);
+        return { ok: true as const, identityId: result.identityId, did: result.did, keyIdentifier: result.keyIdentifier, displayName: identity?.displayName ?? null, identityStatus: identity?.status ?? null, sessionToken };
       }),
     /**
      * Key lifecycle read model. Scoped: only the DID's own linked identity
@@ -149,7 +164,7 @@ export const appRouter = router({
      * arbitrary enumeration of other identities' key material state is not
      * permitted.
      */
-    keyStatus: protectedProcedure.input(z.object({ did: z.string().min(8).max(255) })).query(async ({ input, ctx }) => {
+    keyStatus: protectedProcedure.input(z.object({ did })).query(async ({ input, ctx }) => {
       const actor = await getIdentityByLinkedUserId(ctx.user.id);
       if (actor?.did !== input.did.trim() && ctx.user.role !== "admin") {
         throw new TRPCError({ code: "FORBIDDEN", message: "You may only read the key status of your own DID" });
@@ -169,7 +184,7 @@ export const appRouter = router({
      * DID's key by name, letting one user lock another identity out of DID
      * authentication. Platform administrators may still rotate any DID.
      */
-    rotateKey: protectedProcedure.input(z.object({ did: z.string().min(8).max(255) })).mutation(async ({ input, ctx }) => {
+    rotateKey: protectedProcedure.input(z.object({ did })).mutation(async ({ input, ctx }) => {
       const actor = await getIdentityByLinkedUserId(ctx.user.id);
       if (actor?.did !== input.did.trim() && ctx.user.role !== "admin") {
         await createAuditEvent({ actorIdentityId: actor?.id ?? null, action: "DID_KEY_ROTATION_DENIED", resourceType: "IDENTITY", resourceId: input.did, decision: "DENY", reason: "Only the DID's own identity or an administrator may rotate the key", metadata: { source: "did-lifecycle" } }).catch(() => undefined);
@@ -178,11 +193,31 @@ export const appRouter = router({
       }
       const result = await rotateDidKey(input.did);
       if (!result.ok) throw new TRPCError({ code: "BAD_REQUEST", message: result.reason });
-      await createAuditEvent({ actorIdentityId: actor?.id ?? null, action: "DID_KEY_ROTATED", resourceType: "IDENTITY", resourceId: input.did, decision: "ALLOW", reason: "Key marked ROTATED — previous key cannot authenticate", metadata: { source: "did-lifecycle" } }).catch(() => undefined);
+      await createAuditEvent({ actorIdentityId: actor?.id ?? null, action: "DID_KEY_ROTATED", resourceType: "IDENTITY", resourceId: input.did, decision: "ALLOW", reason: `Key rotated: ${result.previousKeyIdentifier} → ${result.newKeyIdentifier}. Outstanding challenges for the old generation are invalid.`, metadata: { source: "did-lifecycle", previousKeyIdentifier: result.previousKeyIdentifier, newKeyIdentifier: result.newKeyIdentifier } }).catch(() => undefined);
       return result;
     }),
+    /**
+     * DID Document resolution (public-safe view). Returns the verification
+     * method, authentication/assertion references, and lifecycle metadata —
+     * NEVER private key material. Documented internal prototype method
+     * (did:sampraan), not a claim of universal DID-method interoperability.
+     */
+    document: publicProcedure.input(z.object({ did })).query(async ({ input }) => {
+      const document = await resolveDidDocument(input.did.trim());
+      if (!document) throw new TRPCError({ code: "NOT_FOUND", message: "DID not found" });
+      await createAuditEvent({ actorIdentityId: null, action: "DID_DOCUMENT_RESOLVED", resourceType: "IDENTITY", resourceId: input.did, decision: "ALLOW", reason: "Public DID document resolved", metadata: { source: "did-auth" } }).catch(() => undefined);
+      return document;
+    }),
+    /** Per-key lifecycle history (owner/admin scoped — evidence surface). */
+    keyHistory: protectedProcedure.input(z.object({ did })).query(async ({ input, ctx }) => {
+      const actor = await getIdentityByLinkedUserId(ctx.user.id);
+      if (actor?.did !== input.did.trim() && ctx.user.role !== "admin") {
+        throw new TRPCError({ code: "FORBIDDEN", message: "You may only read the key history of your own DID" });
+      }
+      return listDidKeyHistory(input.did.trim());
+    }),
     /** Explicit key activation or revocation (admin only). */
-    setKeyStatus: adminProcedure.input(z.object({ did: z.string().min(8).max(255), keyStatus: z.enum(["ACTIVE", "REVOKED"]) })).mutation(async ({ input, ctx }) => {
+    setKeyStatus: adminProcedure.input(z.object({ did, keyStatus: z.enum(["ACTIVE", "REVOKED"]) })).mutation(async ({ input, ctx }) => {
       const result = await setDidKeyStatus(input.did, input.keyStatus);
       if (!result.ok) throw new TRPCError({ code: "BAD_REQUEST", message: result.reason });
       const actor = await getIdentityByLinkedUserId(ctx.user.id);
@@ -197,20 +232,28 @@ export const appRouter = router({
    */
   stepup: router({
     requestChallenge: protectedProcedure
-      .input(z.object({ assetId: z.string().uuid() }))
+      .input(z.object({ assetId: z.string().uuid(), /** Purpose family of the protected operation (server-scoped; never client-free-form). */ operation: z.enum(["transfer", "content-view", "content-edit"]).default("transfer") }))
       .mutation(async ({ ctx, input }) => {
         const actorIdentity = await getIdentityByLinkedUserId(ctx.user.id);
         if (!actorIdentity) throw new TRPCError({ code: "FORBIDDEN", message: "No SAMPRAAN identity is linked to this session" });
         const asset = await getAssetById(input.assetId);
         if (!asset) throw new TRPCError({ code: "NOT_FOUND", message: "Asset not found" });
-        const purpose = `transfer:${asset.assetId}`;
+        // Purpose is SERVER-COMPOSED from the validated operation enum plus
+        // the asset's ROW id — exactly the token the asset-content gate
+        // probes with (hasValidStepUp). It was previously the business asset
+        // key, which made product-issued challenges unsatisfiable for the
+        // content gate. Single composer: asset-content's stepUpPurposeFor.
+        const purpose = stepUpPurposeFor(
+          input.operation === "content-view" ? "VIEW" : input.operation === "content-edit" ? "EDIT" : "TRANSFER",
+          asset.id,
+        );
         const challenge = await createStepUpChallenge(actorIdentity.id, purpose);
         if (!("nonce" in challenge)) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: challenge.reason });
-        await createAuditEvent({ actorIdentityId: actorIdentity.id, action: "STEP_UP_CHALLENGE_ISSUED", resourceType: "ASSET", resourceId: asset.assetId, decision: "CHALLENGE", reason: `Step-up challenge issued for ${purpose}`, metadata: { source: "step-up", nonceFingerprint: fingerprintNonce(challenge.nonce) } }).catch(() => undefined);
+        await createAuditEvent({ actorIdentityId: actorIdentity.id, action: "STEP_UP_CHALLENGE_ISSUED", resourceType: "ASSET", resourceId: asset.assetId, decision: "CHALLENGE", reason: `Step-up challenge issued for ${purpose}`, metadata: { source: "step-up", nonceFingerprint: fingerprintNonce(challenge.nonce), purpose, keyIdentifier: challenge.keyIdentifier } }).catch(() => undefined);
         return challenge;
       }),
     verify: protectedProcedure
-      .input(z.object({ assetId: z.string().uuid(), nonce: z.string().min(16).max(128), signature: z.string().min(32).max(255) }))
+      .input(z.object({ assetId: z.string().uuid(), nonce: z.string().min(16).max(128), signature: z.string().min(32).max(255), operation: z.enum(["transfer", "content-view", "content-edit"]).default("transfer") }))
       .mutation(async ({ ctx, input }) => {
         const operatorKey = besuBlockchainService?.config.privateKey ?? null;
         if (!operatorKey) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Blockchain operator key is not configured" });
@@ -218,7 +261,12 @@ export const appRouter = router({
         if (!actorIdentity) throw new TRPCError({ code: "FORBIDDEN", message: "No SAMPRAAN identity is linked to this session" });
         const asset = await getAssetById(input.assetId);
         if (!asset) throw new TRPCError({ code: "NOT_FOUND", message: "Asset not found" });
-        const purpose = `transfer:${asset.assetId}`;
+        // Same composition as requestChallenge (row id, not business key) so
+        // the consumed row matches the gate's future probe token-for-token.
+        const purpose = stepUpPurposeFor(
+          input.operation === "content-view" ? "VIEW" : input.operation === "content-edit" ? "EDIT" : "TRANSFER",
+          asset.id,
+        );
         const result = await verifyStepUpChallenge({ identityId: actorIdentity.id, purpose, nonce: input.nonce, signature: input.signature, operatorKey });
         if (!result.ok) {
           await createAuditEvent({ actorIdentityId: actorIdentity.id, action: "STEP_UP_FAILED", resourceType: "ASSET", resourceId: asset.assetId, decision: "DENY", reason: result.reason, metadata: { source: "step-up", code: result.code } }).catch(() => undefined);
@@ -928,7 +976,15 @@ export const appRouter = router({
       //  - risk: advisory level from the security-intelligence rule engine
       // The client can influence NONE of these values.
       const role = ctx.user.role === "admin" ? "ADMIN" : roles[0] ?? "USER";
-      const purpose = `transfer:${asset.assetId}`;
+      // FINAL-AUDIT FIX (step-up purpose parity for TRANSFER): the probe used
+      // a hand-composed `transfer:<business assetId>`, but the challenge was
+      // issued (and signed) for the SINGLE-COMPOSER token
+      // `content-transfer:<asset ROW id>` — see stepUpPurposeFor. Every
+      // correctly-verified transfer step-up was therefore invisible to this
+      // gate: the operator completed step-up perfectly and the policy engine
+      // still returned CHALLENGE (POLICY-STEP-UP) forever. Compose the probe
+      // token through the same single source of truth as the challenge.
+      const purpose = stepUpPurposeFor("TRANSFER", asset.id);
       const [stepUpValid, approvalRow, riskLevel] = await Promise.all([
         actorIdentity ? hasValidStepUp(actorIdentity.id, purpose) : Promise.resolve(false),
         actorIdentity ? getActiveAssetApproval({ assetId: asset.id, requesterIdentityId: actorIdentity.id, action: "TRANSFER" }) : Promise.resolve(undefined),
@@ -1476,6 +1532,23 @@ export const appRouter = router({
     identity: protectedProcedure.input(z.object({ wallet: z.string().regex(/^0x[0-9a-fA-F]{40}$/) })).query(({ input }) => graphQueryService.getIdentity(input.wallet)),
     roleEvents: protectedProcedure.query(() => graphQueryService.getRoleEvents()),
   }),
+  /**
+   * GOVERNANCE & LIFECYCLE (document "Role Definitions and Access Rights"):
+   * identity lifecycle, scoped manager onboarding/suspension, maker-checker
+   * minting, controlled NFT transfer, auditor surfaces, multisig+timelock
+   * proposals, DID documents, key recovery, consent, ownership
+   * presentations. All authorization is resolved SERVER-SIDE from the
+   * session; no client-supplied role/scope/approval field is trusted.
+   */
+  governance: governanceRouter,
+  /**
+   * POLICY-DRIVEN CRYPTO ASSURANCE (ECDSA baseline + ML-DSA-65 post-quantum).
+   * The client never chooses an algorithm: `assurance.policy` explains what an
+   * operation requires, `assurance.challenge` issues the bound payload and
+   * `assurance.verify` returns a single-use grant that a protected operation
+   * consumes exactly once. See modules/crypto-assurance/.
+   */
+  assurance: assuranceRouter,
 });
 
 export type AppRouter = typeof appRouter;

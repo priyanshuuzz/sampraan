@@ -4,6 +4,7 @@ pragma solidity ^0.8.30;
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {ISampraanAccessControl} from "./interfaces/ISampraanAccessControl.sol";
 import {ISampraanIdentityRegistry} from "./interfaces/ISampraanIdentityRegistry.sol";
+import {ISampraanGovernanceTarget} from "./interfaces/ISampraanGovernanceTarget.sol";
 
 /**
  * @title SampraanAssetRegistry
@@ -27,7 +28,7 @@ import {ISampraanIdentityRegistry} from "./interfaces/ISampraanIdentityRegistry.
  * safeTransferFrom) are deliberately disabled: enterprise custody transfers
  * MUST go through transferCustody(), which enforces SAMPRAAN rules.
  */
-contract SampraanAssetRegistry is ERC721 {
+contract SampraanAssetRegistry is ERC721, ISampraanGovernanceTarget {
     enum AssetStatus {
         NONE, // 0 - never registered
         PENDING, // 1 - registered, not yet activated
@@ -48,6 +49,15 @@ contract SampraanAssetRegistry is ERC721 {
 
     ISampraanAccessControl public immutable accessControl;
     ISampraanIdentityRegistry public immutable identityRegistry;
+    /// @notice Governance multisig — sole executor of burnNFT / forceTransfer / pause.
+    address public immutable governance;
+    /// @notice Emergency pause flag (governance-controlled). Blocks every
+    ///         state-changing operation; views stay available for auditors.
+    bool public paused;
+    /// @notice Asset ids with an OPEN dispute — transfers are on HOLD while set.
+    mapping(bytes32 => bool) public disputedAssets;
+    /// @notice Open-dispute token counts for O(1) global queries.
+    uint256 public openDisputeCount;
 
     // tokenId => asset record
     mapping(uint256 => AssetRecord) private _assets;
@@ -86,11 +96,68 @@ contract SampraanAssetRegistry is ERC721 {
         address indexed operator,
         uint64 changedAt
     );
+    event NFTMinted(uint256 indexed tokenId, bytes32 indexed assetIdDigest, address indexed custodian, uint64 at);
+    event NFTAssigned(uint256 indexed tokenId, address indexed custodian, address indexed operator, uint64 at);
+    event NFTRevoked(uint256 indexed tokenId, bytes32 indexed assetIdDigest, address indexed actor, string reason, uint64 at);
+    event ForcedTransfer(uint256 indexed tokenId, address indexed fromCustodian, address indexed toCustodian, address actor, string reason, uint64 at);
+    event SystemPaused(address indexed actor, string reason, uint64 at);
+    event SystemUnpaused(address indexed actor, string reason, uint64 at);
+
+    /// ---------------- auditor-owned governance evidence ----------------
+    struct Dispute {
+        uint256 tokenId;
+        address raisedBy;
+        bytes32 evidenceHash; // hash-only; contents stay off-chain
+        string reason;
+        bool open;
+        bool upheld;
+        string resolutionReason;
+        uint64 raisedAt;
+        uint64 resolvedAt;
+    }
+    mapping(uint256 => Dispute) public disputes;
+    uint256 public disputeCount;
+
+    struct Anomaly {
+        address target; // flagged wallet or asset custodian context
+        uint256 tokenId; // 0 when the flag is identity-scoped
+        address flaggedBy;
+        string reason;
+        uint64 at;
+    }
+    mapping(uint256 => Anomaly) public anomalies;
+    uint256 public anomalyCount;
+
+    event DisputeRaised(uint256 indexed disputeId, uint256 indexed tokenId, address indexed raisedBy, bytes32 evidenceHash, string reason, uint64 at);
+    event DisputeResolved(uint256 indexed disputeId, uint256 indexed tokenId, address indexed resolver, bool upheld, string reason, uint64 at);
+    event AnomalyFlagged(uint256 indexed anomalyId, address indexed target, uint256 tokenId, address flaggedBy, string reason, uint64 at);
+
+    /// ---------------- on-chain audit report hashes ----------------
+    struct AuditReport {
+        address auditor;
+        bytes32 reportHash; // hash of the OFF-CHAIN report; contents never on-chain
+        uint64 at;
+    }
+    mapping(uint256 => AuditReport) public auditReports;
+    uint256 public auditReportCount;
+    event AuditReportHashStored(uint256 indexed reportId, address indexed auditor, bytes32 indexed reportHash, uint64 at);
+
+    /// ---------------- ownership history (auditor verification surface) ----
+    struct CustodyRecord {
+        address fromCustodian;
+        address toCustodian;
+        address operator;
+        uint64 at;
+    }
+    mapping(uint256 => CustodyRecord[]) private _custodyHistory;
+    mapping(uint256 => uint256) public custodyHistoryLength;
 
     error NotAssetManager();
     error NotAuthorizedOperator();
+    error NotGovernance();
     error ZeroAddress();
     error ZeroDigest();
+    error ZeroReason();
     error AssetAlreadyRegistered();
     error AssetNotRegistered();
     error InvalidAssetStatus();
@@ -100,8 +167,15 @@ contract SampraanAssetRegistry is ERC721 {
     error RecipientNotActive();
     error OperatorNotAuthorized();
     error CustodyTransferForbidden();
+    error Paused();
+    error AssetDisputed();
+    error NotAuditor();
+    error NotAdmin();
+    error DisputeNotOpen();
+    error EmptyEvidenceHash();
 
     modifier onlyAssetManager() {
+        if (paused) revert Paused();
         if (!accessControl.hasRole(accessControl.ASSET_MANAGER_ROLE(), msg.sender)) {
             revert NotAssetManager();
         }
@@ -109,20 +183,29 @@ contract SampraanAssetRegistry is ERC721 {
     }
 
     modifier onlyAuthorizedOperator() {
+        if (paused) revert Paused();
         if (!accessControl.hasRole(accessControl.ASSET_MANAGER_ROLE(), msg.sender)) {
             revert NotAuthorizedOperator();
         }
         _;
     }
 
+    modifier whenNotPaused() {
+        if (paused) revert Paused();
+        _;
+    }
+
     constructor(
         address accessControlAddress,
-        address identityRegistryAddress
+        address identityRegistryAddress,
+        address governanceAddress
     ) ERC721("SAMPRAAN Enterprise Asset", "SMPRA") {
         if (accessControlAddress == address(0)) revert ZeroAddress();
         if (identityRegistryAddress == address(0)) revert ZeroAddress();
+        if (governanceAddress == address(0)) revert ZeroAddress();
         accessControl = ISampraanAccessControl(accessControlAddress);
         identityRegistry = ISampraanIdentityRegistry(identityRegistryAddress);
+        governance = governanceAddress;
     }
 
     // ------------------------------------------------------------------
@@ -164,6 +247,15 @@ contract SampraanAssetRegistry is ERC721 {
         // required and no uncontrolled contract callback is invoked.
         _mint(custodian, tokenId);
 
+        _custodyHistory[tokenId].push(CustodyRecord({
+            fromCustodian: address(0),
+            toCustodian: custodian,
+            operator: msg.sender,
+            at: uint64(block.timestamp)
+        }));
+        custodyHistoryLength[tokenId] = 1;
+
+        emit NFTMinted(tokenId, assetIdDigest, custodian, uint64(block.timestamp));
         emit AssetRegistered(
             tokenId,
             assetIdDigest,
@@ -196,6 +288,15 @@ contract SampraanAssetRegistry is ERC721 {
         address previous = asset.custodian;
         asset.custodian = custodian;
 
+        _custodyHistory[tokenId].push(CustodyRecord({
+            fromCustodian: previous,
+            toCustodian: custodian,
+            operator: msg.sender,
+            at: uint64(block.timestamp)
+        }));
+        custodyHistoryLength[tokenId] += 1;
+
+        emit NFTAssigned(tokenId, custodian, msg.sender, uint64(block.timestamp));
         emit AssetAssigned(tokenId, asset.assetIdDigest, custodian, msg.sender, uint64(block.timestamp));
 
         // Keep ERC-721 internal ownership aligned with custodian state.
@@ -218,6 +319,7 @@ contract SampraanAssetRegistry is ERC721 {
         AssetRecord storage asset = _assets[tokenId];
         if (asset.status == AssetStatus.NONE) revert AssetNotRegistered();
         if (asset.status != AssetStatus.ACTIVE) revert AssetNotActive();
+        if (disputedAssets[asset.assetIdDigest]) revert AssetDisputed();
         if (toCustodian == address(0)) revert ZeroAddress();
         if (toCustodian == asset.custodian) revert SameAssetStatus();
         if (!identityRegistry.isActive(asset.custodian)) revert CustodianNotActive();
@@ -226,6 +328,14 @@ contract SampraanAssetRegistry is ERC721 {
         address fromCustodian = asset.custodian;
         asset.custodian = toCustodian;
         asset.statusChangedAt = uint64(block.timestamp);
+
+        _custodyHistory[tokenId].push(CustodyRecord({
+            fromCustodian: fromCustodian,
+            toCustodian: toCustodian,
+            operator: msg.sender,
+            at: uint64(block.timestamp)
+        }));
+        custodyHistoryLength[tokenId] += 1;
 
         _transfer(fromCustodian, toCustodian, tokenId);
 
@@ -339,6 +449,209 @@ contract SampraanAssetRegistry is ERC721 {
                 _toHexString(asset.metadataDigest)
             )
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Auditor-owned evidence surfaces (read-only + hash commitments only)
+    // ------------------------------------------------------------------
+
+    /**
+     * @notice Flag an anomaly. AUDITOR-only, and deliberately WITHOUT any
+     *         effect on ownership or permissions — the flag is evidence for
+     *         the audit trail and an input to human processes, never a
+     *         mutation vector (document: "Auditor can flag only").
+     */
+    function flagAnomaly(address target, uint256 tokenId, string calldata reason) external {
+        if (paused) revert Paused();
+        if (!accessControl.hasRole(accessControl.AUDITOR_ROLE(), msg.sender)) revert NotAuditor();
+        if (target == address(0)) revert ZeroAddress();
+        if (bytes(reason).length == 0) revert ZeroReason();
+        uint256 id = ++anomalyCount;
+        anomalies[id] = Anomaly({ target: target, tokenId: tokenId, flaggedBy: msg.sender, reason: reason, at: uint64(block.timestamp) });
+        emit AnomalyFlagged(id, target, tokenId, msg.sender, reason, uint64(block.timestamp));
+    }
+
+    /**
+     * @notice Raise a dispute over an asset. Places the asset's TRANSFER on
+     *         HOLD (disputedAssets) until an admin resolves. AUDITOR-only.
+     */
+    function raiseDispute(uint256 tokenId, bytes32 evidenceHash, string calldata reason) external {
+        if (paused) revert Paused();
+        if (!accessControl.hasRole(accessControl.AUDITOR_ROLE(), msg.sender)) revert NotAuditor();
+        if (_assets[tokenId].status == AssetStatus.NONE) revert AssetNotRegistered();
+        if (evidenceHash == bytes32(0)) revert EmptyEvidenceHash();
+        if (bytes(reason).length == 0) revert ZeroReason();
+        if (disputedAssets[_assets[tokenId].assetIdDigest]) revert AssetDisputed();
+        uint256 id = ++disputeCount;
+        disputes[id] = Dispute({
+            tokenId: tokenId,
+            raisedBy: msg.sender,
+            evidenceHash: evidenceHash,
+            reason: reason,
+            open: true,
+            upheld: false,
+            resolutionReason: "",
+            raisedAt: uint64(block.timestamp),
+            resolvedAt: 0
+        });
+        disputedAssets[_assets[tokenId].assetIdDigest] = true;
+        openDisputeCount += 1;
+        emit DisputeRaised(id, tokenId, msg.sender, evidenceHash, reason, uint64(block.timestamp));
+    }
+
+    /**
+     * @notice Resolve a dispute. ADMIN-only (DEFAULT_ADMIN_ROLE); the auditor
+     *         who raised it can NEVER resolve (role exclusivity makes an
+     *         auditor-admin impossible on-chain). Upheld disputes leave the
+     *         asset frozen for governance recovery (burn/forceTransfer);
+     *         rejected disputes release the hold. Assets are never destroyed
+     *         silently — recovery itself is a governance proposal.
+     */
+    function resolveDispute(uint256 disputeId, bool upheld, string calldata reason) external {
+        if (paused) revert Paused();
+        if (!accessControl.hasRole(accessControl.DEFAULT_ADMIN_ROLE(), msg.sender)) revert NotAdmin();
+        Dispute storage dispute = disputes[disputeId];
+        if (!dispute.open) revert DisputeNotOpen();
+        if (bytes(reason).length == 0) revert ZeroReason();
+        dispute.open = false;
+        dispute.upheld = upheld;
+        dispute.resolutionReason = reason;
+        dispute.resolvedAt = uint64(block.timestamp);
+        if (!upheld) {
+            disputedAssets[_assets[dispute.tokenId].assetIdDigest] = false;
+            openDisputeCount -= 1;
+        }
+        emit DisputeResolved(disputeId, dispute.tokenId, msg.sender, upheld, reason, uint64(block.timestamp));
+    }
+
+    /**
+     * @notice Commit the HASH of an off-chain audit report on-chain. The
+     *         report contents NEVER enter the chain. AUDITOR-only.
+     */
+    function storeAuditReportHash(bytes32 reportHash) external {
+        if (!accessControl.hasRole(accessControl.AUDITOR_ROLE(), msg.sender)) revert NotAuditor();
+        if (reportHash == bytes32(0)) revert EmptyEvidenceHash();
+        uint256 id = ++auditReportCount;
+        auditReports[id] = AuditReport({ auditor: msg.sender, reportHash: reportHash, at: uint64(block.timestamp) });
+        emit AuditReportHashStored(id, msg.sender, reportHash, uint64(block.timestamp));
+    }
+
+    // ------------------------------------------------------------------
+    // Auditor verification views (read-only by role-restricted convention:
+    // views are open because they expose only on-chain digests)
+    // ------------------------------------------------------------------
+
+    /// @notice TRUE when `wallet` is the CURRENT custodian of the token.
+    function verifyOwnership(uint256 tokenId, address wallet) external view returns (bool) {
+        return _assets[tokenId].custodian == wallet;
+    }
+
+    /// @notice TRUE when the token is registered and its record is intact.
+    function verifyAuthenticity(uint256 tokenId) external view returns (bool) {
+        return _assets[tokenId].status != AssetStatus.NONE;
+    }
+
+    function getDispute(uint256 disputeId) external view returns (Dispute memory) {
+        return disputes[disputeId];
+    }
+
+    function getAnomaly(uint256 anomalyId) external view returns (Anomaly memory) {
+        return anomalies[anomalyId];
+    }
+
+    function getAuditReport(uint256 reportId) external view returns (AuditReport memory) {
+        return auditReports[reportId];
+    }
+
+    function getCustodyHistoryLength(uint256 tokenId) external view returns (uint256) {
+        return custodyHistoryLength[tokenId];
+    }
+
+    function getCustodyRecord(uint256 tokenId, uint256 index) external view returns (CustodyRecord memory) {
+        return _custodyHistory[tokenId][index];
+    }
+
+    function isAssetDisputed(uint256 tokenId) external view returns (bool) {
+        if (_assets[tokenId].status == AssetStatus.NONE) revert AssetNotRegistered();
+        return disputedAssets[_assets[tokenId].assetIdDigest];
+    }
+
+    // ------------------------------------------------------------------
+    // Emergency pause (governance-only) + governance dispatch
+    // ------------------------------------------------------------------
+
+    function governancePause() external {
+        if (msg.sender != governance) revert NotGovernance();
+        if (paused) revert SameAssetStatus();
+        paused = true;
+        emit SystemPaused(msg.sender, "governance proposal", uint64(block.timestamp));
+    }
+
+    function governanceUnpause() external {
+        if (msg.sender != governance) revert NotGovernance();
+        if (!paused) revert SameAssetStatus();
+        paused = false;
+        emit SystemUnpaused(msg.sender, "governance proposal", uint64(block.timestamp));
+    }
+
+    /**
+     * @notice Governance-approved burn of a disputed/compromised NFT. The
+     *         asset status becomes REVOKED (terminal) and the token is burned.
+     *         Recovery of custody evidence stays in the history — never a
+     *         silent destruction.
+     */
+    function governanceBurnNFT(uint256 tokenId, string calldata reason) external {
+        if (msg.sender != governance) revert NotGovernance();
+        if (bytes(reason).length == 0) revert ZeroReason();
+        AssetRecord storage asset = _assets[tokenId];
+        if (asset.status == AssetStatus.NONE) revert AssetNotRegistered();
+        if (asset.status == AssetStatus.REVOKED) revert InvalidAssetStatus();
+        asset.status = AssetStatus.REVOKED;
+        asset.statusChangedAt = uint64(block.timestamp);
+        emit NFTRevoked(tokenId, asset.assetIdDigest, msg.sender, reason, uint64(block.timestamp));
+        _burn(tokenId);
+    }
+
+    /**
+     * @notice Governance-approved forced custody transfer (emergency recovery).
+     *         Works regardless of asset status or disputes — that is its
+     *         purpose — but ONLY through quorum + timelock.
+     */
+    function governanceForceTransfer(uint256 tokenId, address toCustodian, string calldata reason) external {
+        if (msg.sender != governance) revert NotGovernance();
+        if (bytes(reason).length == 0) revert ZeroReason();
+        AssetRecord storage asset = _assets[tokenId];
+        if (asset.status == AssetStatus.NONE) revert AssetNotRegistered();
+        if (toCustodian == address(0)) revert ZeroAddress();
+        if (toCustodian == asset.custodian) revert SameAssetStatus();
+        address fromCustodian = asset.custodian;
+        asset.custodian = toCustodian;
+        asset.statusChangedAt = uint64(block.timestamp);
+        _custodyHistory[tokenId].push(CustodyRecord({
+            fromCustodian: fromCustodian,
+            toCustodian: toCustodian,
+            operator: msg.sender,
+            at: uint64(block.timestamp)
+        }));
+        custodyHistoryLength[tokenId] += 1;
+        emit ForcedTransfer(tokenId, fromCustodian, toCustodian, msg.sender, reason, uint64(block.timestamp));
+        _transfer(fromCustodian, toCustodian, tokenId);
+    }
+
+    function sampraanGovernanceTargetVersion() external pure returns (uint256) {
+        return 1;
+    }
+
+    function governanceGrantRole(bytes32, address) external pure {
+        revert InvalidAssetStatus(); // role administration lives on AccessControl
+    }
+
+    function governanceRevokeRole(bytes32, address) external pure {
+        revert InvalidAssetStatus(); // role administration lives on AccessControl
+    }
+
+    function governanceDeactivateIdentity(address, string calldata) external pure {
+        revert InvalidAssetStatus(); // identity lifecycle lives on IdentityRegistry
     }
 
     // ------------------------------------------------------------------

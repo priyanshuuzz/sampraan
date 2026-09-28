@@ -2,12 +2,19 @@
   "network": "SAMPRAAN-LOCAL-QBFT",
   "chainId": 4224,
   "rpcUrl": "http://localhost:8545",
-  "deployedAt": "2026-09-20T13:03:41.566Z",
+  "deployedAt": "2026-09-27T14:38:25.126Z",
   "deployerAddress": "0xFE3B557E8Fb62b89F4916B721be55cEb828dBd73",
   "auditorAddress": "0x627306090abaB3A6e1400e9345bC60c78a8BEf57",
+  "governanceAddress": "0xD3e4702db965B10F86F44229691BC1cD6059db1F",
+  "governance": {
+    "quorumPercent": 67,
+    "timelockDelaySeconds": 60,
+    "note": "DEMO values — raise the timelock delay for any real deployment"
+  },
   "contracts": {
-    "SampraanAccessControl": "0x42699A7612A82f1d9C36148af9C77354759b210b",
-    "SampraanIdentityRegistry": "0xa50a51c09a5c451C52BB714527E1974b686D8e77",
-    "SampraanAssetRegistry": "0x9a3DBCa554e9f6b9257aAa24010DA8377C57c17e"
+    "SampraanAccessControl": "0x99AFFfaAe8920A31208694F3Cf051E12B59e147f",
+    "SampraanIdentityRegistry": "0xfCd7761aD32674076c3C0EFc5e76048ae91C30eD",
+    "SampraanAssetRegistry": "0x035942eb75f9e1FF2A1cC8aF3C59B4d48a6bE963",
+    "SampraanGovernance": "0xD3e4702db965B10F86F44229691BC1cD6059db1F"
   }
 }

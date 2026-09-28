@@ -42,20 +42,25 @@ const api = client();
   const admin = await api.call("auth.login", { email: "admin@sampraan.dev", password: "SampraanAdmin#2026" }, { method: "POST" });
   check("admin login", admin.ok && admin.data?.user?.role === "admin", admin.error ?? admin.data?.user?.role);
 
-  console.log("=== DID CHALLENGE-RESPONSE (LOOP 2) ===");
+  console.log("=== DID CHALLENGE-RESPONSE (LOOP 2, HARDENED) ===");
   const DID = "did:sampraan:dev-admin-aarav";
   const challenge = await api.call("did.requestChallenge", { did: DID }, { method: "POST" });
   check("challenge issued with nonce + expiry", challenge.ok && !!challenge.data?.nonce && !!challenge.data?.expiresAt, challenge.error ?? challenge.data?.nonce?.slice(0, 12) + "…");
+  check("challenge carries structured bindings (purpose/audience/keyId)", !!challenge.data?.purpose && !!challenge.data?.audience && !!challenge.data?.keyIdentifier, `${challenge.data?.purpose ?? "-"} / ${challenge.data?.audience ?? "-"} / ${challenge.data?.keyIdentifier ?? "-"}`);
   const malformed = await api.call("did.verifyChallenge", { did: DID, nonce: challenge.data?.nonce ?? "", signature: "0x" + "00".repeat(65) }, { method: "POST", expect: 401 });
   check("invalid signature rejected (401)", malformed.status === 401, malformed.error?.slice(0, 60));
   const replay = await api.call("did.verifyChallenge", { did: DID, nonce: challenge.data?.nonce ?? "", signature: "0x" + "00".repeat(65) }, { method: "POST", expect: 401 });
   check("nonce single-use (replay rejected)", replay.status === 401, replay.error?.slice(0, 60));
   const unknownDid = await api.call("did.requestChallenge", { did: "did:sampraan:no-such-identity" }, { method: "POST", expect: 404 });
   check("unknown DID rejected (404)", unknownDid.status === 404, unknownDid.error?.slice(0, 50));
+  const doc = await api.call("did.document", { did: DID });
+  check("DID document resolves with verification method (no private material)", doc.ok && (doc.data?.verificationMethod?.length ?? 0) > 0 && !JSON.stringify(doc.data).match(/privatekey/i), doc.error ?? `${doc.data?.verificationMethod?.[0]?.type} keyId=${doc.data?.sampraan?.keyIdentifier}`);
 
-  console.log("=== KEY LIFECYCLE (LOOP 3) ===");
+  console.log("=== KEY LIFECYCLE (LOOP 3, HARDENED) ===");
   const ks = await api.call("did.keyStatus", { did: DID });
   check("key status readable", ks.ok && !!ks.data?.keyStatus, ks.error ?? ks.data?.keyStatus);
+  const kh = await api.call("did.keyHistory", { did: DID });
+  check("key lifecycle history readable (owner-scoped)", kh.ok && Array.isArray(kh.data), kh.error ?? `${kh.data?.length ?? 0} generation(s) on record`);
   console.log("=== POLICY SIMULATOR (LOOP 10) ===");
   const cases = [
     { input: { role: "ADMIN", assetClassification: "CONTROLLED", action: "CREATE_ASSET" }, expect: "ALLOW", label: "ADMIN CREATE ASSET → ALLOW" },

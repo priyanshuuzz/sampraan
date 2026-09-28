@@ -49,6 +49,19 @@ if (!url) throw new Error("DATABASE_URL is required to run the demo seed (set it
 const connection = await mysql.createConnection(url);
 
 /**
+ * Seed FICTIONAL demo asset content (v1) for development.
+ *
+ * Uses the REAL production content pipeline — server-side AES-256-GCM
+ * envelope encryption and the StorageProvider abstraction — so the stored
+ * ciphertext is exactly what the live flow produces, and integrity
+ * verification works out of the box. Content is non-sensitive fictional
+ * material; every seeded version row is attributed to the ADMIN identity
+ * with an explicit `seed` change note and carries NO transaction hash (no
+ * fake chain evidence — the version anchor is produced lazily on the next
+ * authorized content edit, like any other asset).
+ */
+
+/**
  * LOCAL DEMO ONLY — anchor seeded assets on the real local Besu chain.
  *
  * The seed INITIALIZES data; it never fakes blockchain transactions. When a
@@ -107,6 +120,62 @@ async function anchorAssets(input) {
   // Mirrors deriveIdentityWallet() in anchoring.service.ts.
   const deriveWallet = (did) => new Wallet(keccak256(solidityPacked(["bytes32", "string"], [operatorKeyHash, did]))).address;
 
+  // IDENTITY LIFECYCLE RECONCILIATION: the governance registry registers
+  // identities as PENDING, and the contract refuses to treat a PENDING
+  // identity as an asset custodian or a transfer recipient
+  // (CustodianNotActive / RecipientNotActive). Any identity the read model
+  // considers active must therefore be VERIFIED on-chain. This repairs state
+  // created before the lifecycle change (or by an interrupted run) and is
+  // idempotent: it never re-activates an identity that is SUSPENDED or
+  // DEACTIVATED on-chain, and never fabricates a chain record.
+  try {
+    const identityArtifact = JSON.parse(readFileSync(path.join(root, "blockchain", "artifacts", "SampraanIdentityRegistry.json"), "utf8"));
+    const identityRegistry = new Contract(deployment.contracts.SampraanIdentityRegistry, identityArtifact.abi, wallet);
+    const [identRows] = await connection.execute("SELECT did, status, lifecycleState FROM identities");
+    let promoted = 0;
+    let alreadyVerified = 0;
+    let stillPending = 0;
+    for (const row of identRows) {
+      const dbActive = String(row.status).toUpperCase() === "ACTIVE" && String(row.lifecycleState ?? "").toUpperCase() !== "DEACTIVATED";
+      const vendor = deriveWallet(row.did);
+      let onChain;
+      try {
+        onChain = await identityRegistry.getIdentity(vendor);
+      } catch {
+        continue; // identity not resolvable on-chain: nothing to reconcile
+      }
+      if (onChain.status === 0n) continue; // never registered on-chain
+      if (onChain.status !== 1n) {
+        alreadyVerified += 1;
+        continue;
+      }
+      if (!dbActive) {
+        stillPending += 1;
+        continue;
+      }
+      const verifyTx = await identityRegistry.verifyIdentity(vendor, "seed: reconcile identity lifecycle with read model");
+      const verifyReceipt = await verifyTx.wait();
+      promoted += 1;
+      await input.auditSink({
+        id: id(`audit-identity-verify-${row.did}`),
+        actorIdentityId: IDN.ADMIN,
+        action: "BLOCKCHAIN_ANCHOR_CONFIRMED",
+        resourceType: "IDENTITY",
+        resourceId: row.did,
+        decision: "ALLOW",
+        reason: `Seed reconciliation: on-chain identity promoted PENDING -> VERIFIED (block ${verifyReceipt.blockNumber})`,
+        timestamp: new Date(),
+        transactionHash: verifyReceipt.hash,
+        blockNumber: verifyReceipt.blockNumber,
+        metadata: { source: "seed", reconciliation: true, walletAddress: vendor },
+      });
+    }
+    console.log(`[seed] identity lifecycle reconciliation: ${promoted} promoted to VERIFIED, ${alreadyVerified} already verified, ${stillPending} left PENDING (read model not active)`);
+  } catch (error) {
+    const reason = error?.reason ?? error?.shortMessage ?? error?.message ?? String(error);
+    console.warn(`[seed] identity lifecycle reconciliation failed: ${reason}`);
+  }
+
   // INTEGRITY SWEEP: every asset in the read model must be backed by real
   // chain state. Mint any asset that still lacks a token id (e.g. rows left
   // un-anchored by an earlier session) — never fake one.
@@ -128,6 +197,14 @@ async function anchorAssets(input) {
         if (!identityRecord || identityRecord.status === 0n) {
           const regTx = await identityRegistry.registerIdentity(custodianWallet, keccak256(toUtf8Bytes(custodianDid)), keccak256(toUtf8Bytes(`pk:${custodianDid}`)));
           await regTx.wait();
+        }
+        // The governance registry registers identities as PENDING, and a
+        // PENDING custodian cannot receive a mint (CustodianNotActive).
+        // Promote to VERIFIED (reason-carrying, on-chain) before anchoring.
+        const sweptStatus = (await identityRegistry.getIdentity(custodianWallet)).status;
+        if (sweptStatus === 1n) {
+          const verifyTx = await identityRegistry.verifyIdentity(custodianWallet, "seed: demo identity verification");
+          await verifyTx.wait();
         }
         const tx = await registry.registerAsset(
           keccak256(toUtf8Bytes(asset.assetId)),
@@ -191,6 +268,14 @@ async function anchorAssets(input) {
         const regTx = await identityRegistry.registerIdentity(custodianWallet, didDigest, pkDigest);
         await regTx.wait();
       }
+      // Registration alone leaves the identity PENDING on-chain, which the
+      // registry refuses to treat as an active custodian (CustodianNotActive).
+      // Promote to VERIFIED (reason-carrying, on-chain) before minting.
+      const currentStatus = (await identityRegistry.getIdentity(custodianWallet)).status;
+      if (currentStatus === 1n) {
+        const verifyTx = await identityRegistry.verifyIdentity(custodianWallet, "seed: demo identity verification");
+        await verifyTx.wait();
+      }
       const tx = await registry.registerAsset(
         assetDigest,
         custodianWallet,
@@ -239,6 +324,71 @@ async function anchorAssets(input) {
   }
 }
 
+/**
+ * Seed FICTIONAL demo asset content (v1) for development.
+ *
+ * Uses the REAL production content pipeline — server-side AES-256-GCM
+ * envelope encryption and the StorageProvider abstraction — so the stored
+ * ciphertext is exactly what the live flow produces, and integrity
+ * verification works out of the box. Content is non-sensitive fictional
+ * material; every seeded version row is attributed to the ADMIN identity
+ * with an explicit `seed` change note and carries NO transaction hash (no
+ * fake chain evidence).
+ */
+async function seedDemoAssetContent({ id, upsert }) {
+  let contentModule;
+  try {
+    contentModule = await import("./modules/asset-content/content.service.ts");
+  } catch (error) {
+    console.warn(`[seed] asset-content pipeline unavailable (${error?.message ?? error}); skipping demo content.`);
+    return;
+  }
+  const { encryptAndStore: encrypt, validateUpload: validate } = contentModule;
+
+  const demoFiles = [
+    [ASSETS.INSTRUMENT, "System_Configuration.txt", Buffer.from(
+      "SAMPRAAN DEMO — Environmental Test Instrument Configuration\n" +
+      "(Fictional development data — not operational BEL material.)\n\n" +
+      "instrument.id          = ENV-TEST-002\n" +
+      "sampling.interval_sec  = 30\n" +
+      "calibration.due_date   = 2026-12-01\n" +
+      "telemetry.endpoint     = udp://10.20.30.40:514 (fictional)\n" +
+      "operator.region        = DEMO-GRID-7\n",
+      "utf8")],
+    [ASSETS.SPEC, "Equipment_Inspection_Report.txt", Buffer.from(
+      "SAMPRAAN DEMO — Equipment Inspection Report\n" +
+      "(Fictional development data — not operational BEL material.)\n\n" +
+      "Scope: radar interface cabinet, demo rig #3.\n" +
+      "Finding 1: fan bearing wear within tolerance.\n" +
+      "Finding 2: shielding gasket replacement recommended Q4.\n" +
+      "Conclusion: FIT FOR DEMONSTRATION USE.\n",
+      "utf8")],
+    [ASSETS.FIRMWARE, "Firmware_Release_Notes.txt", Buffer.from(
+      "SAMPRAAN DEMO — Firmware Release Notes 2.4.1\n" +
+      "(Fictional development data — not operational BEL material.)\n\n" +
+      "- Hardened bootloader signature checks.\n" +
+      "- Fixed telemetry packet counter rollover.\n" +
+      "- Known issue: UI flicker below -20C.\n",
+      "utf8")],
+  ];
+
+  for (const [assetRowId, filename, data] of demoFiles) {
+    try {
+      const validated = validate({ originalFilename: filename, clientMimeType: null, data });
+      const stored = await encrypt(validated);
+      await upsert(
+        "INSERT INTO asset_content_versions (id, assetId, versionNumber, filename, originalFilename, mimeType, sizeBytes, contentHash, storageProvider, storageReference, encryption, createdByIdentityId, changeNote) " +
+        "SELECT ?, a.id, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM assets a WHERE a.id = ? " +
+        "AND NOT EXISTS (SELECT 1 FROM asset_content_versions v WHERE v.assetId = a.id)",
+        [id(`content-${filename}`), stored.filename, validated.originalFilename, stored.mimeType, validated.sizeBytes, stored.contentHash, stored.storageProvider, stored.storageReference, JSON.stringify(stored.encryption), IDN.ADMIN, "Seed: fictional demo content (v1)", assetRowId],
+      );
+      console.log(`[seed] demo content stored (encrypted): ${filename} → ${stored.storageReference.slice(0, 18)}…`);
+    } catch (error) {
+      console.warn(`[seed] demo content FAILED for ${filename}: ${error?.message ?? error}`);
+    }
+  }
+}
+
 // ---------- deterministic identifiers (stable across re-runs) ----------
 //
 // Deterministic UUIDs derived from a stable name (keccak-based, v4-shaped per
@@ -255,7 +405,7 @@ const uuidFromName = (name) => {
 };
 const id = uuidFromName;
 // Permission catalog keys (UNIQUE `key` column in permissions).
-const PERM_KEYS = ["identity:create","identity:read","identity:update","identity:revoke","asset:create","asset:read","asset:assign","asset:transfer","asset:revoke","audit:read","policy:create","policy:update","administration:manage"];
+const PERM_KEYS = ["identity:create","identity:read","identity:update","identity:revoke","asset:create","asset:read","asset:edit","asset:assign","asset:transfer","asset:revoke","audit:read","policy:create","policy:update","administration:manage"];
 const IDN = {
   ADMIN: id("identity-admin"), MANAGER: id("identity-manager"),
   AUDITOR: id("identity-auditor"), USER: id("identity-user"),
@@ -287,10 +437,10 @@ try {
   // was silently dropped by INSERT IGNORE — leaving identities with NO
   // roles and the authorization engine denying every non-admin transfer).
   const roleDescriptions = {
-    ADMIN: "Full administrative control: identities, roles, assets, policies, audit.",
-    MANAGER: "Operate on permitted assets: assign and transfer custody of non-step-up assets.",
+    ADMIN: "Full administrative control: identities, roles, assets, policies, audit, access grants.",
+    MANAGER: "Operate on permitted assets: edit content, create versions, assign and transfer custody.",
     AUDITOR: "Read-only inspection of assets, provenance, and the audit trail. No mutation.",
-    USER: "Explicitly permitted operations only (asset:read). No custody mutations.",
+    USER: "Explicitly permitted operations only (asset:read). No content or custody mutations.",
   };
   const roleIdByName = {};
   for (const [name, description] of Object.entries(roleDescriptions)) {
@@ -317,8 +467,8 @@ try {
 
   // Role → permission matrix (least privilege); both sides resolved by name.
   const ROLE_PERMISSIONS = {
-    ADMIN: ["identity:create","identity:read","identity:update","identity:revoke","asset:create","asset:read","asset:assign","asset:transfer","asset:revoke","audit:read","policy:create","policy:update","administration:manage"],
-    MANAGER: ["identity:read","asset:read","asset:assign","asset:transfer","audit:read"],
+    ADMIN: ["identity:create","identity:read","identity:update","identity:revoke","asset:create","asset:read","asset:edit","asset:assign","asset:transfer","asset:revoke","audit:read","policy:create","policy:update","administration:manage"],
+    MANAGER: ["identity:read","asset:read","asset:edit","asset:assign","asset:transfer","audit:read"],
     AUDITOR: ["identity:read","asset:read","audit:read"],
     USER: ["asset:read"],
   };
@@ -502,6 +652,7 @@ try {
     );
   }
 
+  await seedDemoAssetContent({ id, upsert });
   await connection.commit();
   console.log("Deterministic SAMPRAAN development seed applied (idempotent).");
   console.log("Local accounts (fictional, dev-only):");

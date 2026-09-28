@@ -42,6 +42,7 @@ const lazyAbi = (name: string) => {
 export const getSampraanAccessControlABI = lazyAbi("SampraanAccessControl");
 export const getSampraanIdentityRegistryABI = lazyAbi("SampraanIdentityRegistry");
 export const getSampraanAssetRegistryABI = lazyAbi("SampraanAssetRegistry");
+export const getSampraanGovernanceABI = lazyAbi("SampraanGovernance");
 
 interface ContractLike {
   connect: (signer: Signer) => unknown;
@@ -105,11 +106,53 @@ export class SampraanIdentityRegistryHandle {
     return call(this.contract.registerIdentity, wallet, didDigest, publicKeyDigest);
   }
 
-  setStatus(
+  // GOVERNANCE LIFECYCLE: the old setStatus(wallet, code) was replaced by
+  // explicit, reason-carrying lifecycle transitions enforced on-chain.
+  verifyIdentity(
     wallet: string,
-    status: number
+    reason: string
   ): Promise<{ wait: (c?: number) => Promise<unknown> }> {
-    return call(this.contract.setStatus, wallet, status);
+    return call(this.contract.verifyIdentity, wallet, reason);
+  }
+
+  suspendIdentity(
+    wallet: string,
+    reason: string
+  ): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.suspendIdentity, wallet, reason);
+  }
+
+  reactivateIdentity(
+    wallet: string,
+    reason: string
+  ): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.reactivateIdentity, wallet, reason);
+  }
+
+  updateDidDocumentHash(
+    documentHash: string,
+    reason: string
+  ): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.updateDidDocumentHash, documentHash, reason);
+  }
+
+  updateDidDocumentHashFor(
+    wallet: string,
+    documentHash: string,
+    reason: string
+  ): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.updateDidDocumentHashFor, wallet, documentHash, reason);
+  }
+
+  getLifecycleCount(wallet: string): Promise<bigint> {
+    return call<bigint>(this.contract.lifecycleCount, wallet);
+  }
+
+  getLifecycleEvent(
+    wallet: string,
+    index: number
+  ): Promise<{ fromStatus: bigint; toStatus: bigint; actor: string; reason: string; at: bigint }> {
+    return call(this.contract.getLifecycleEvent, wallet, index);
   }
 
   getIdentity(wallet: string): Promise<IdentityRecord> {
@@ -205,6 +248,122 @@ export class SampraanAssetRegistryHandle {
   totalAssets(): Promise<bigint> {
     return call<bigint>(this.contract.totalAssets);
   }
+
+  // Governance-only dispatch (multisig + timelock; NEVER callable directly
+  // by the operator — the contract reverts unless msg.sender is governance).
+  governanceBurnNFT(
+    tokenId: bigint,
+    reason: string
+  ): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.governanceBurnNFT, tokenId, reason);
+  }
+
+  governanceForceTransfer(
+    tokenId: bigint,
+    toCustodian: string,
+    reason: string
+  ): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.governanceForceTransfer, tokenId, toCustodian, reason);
+  }
+
+  governancePause(): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.governancePause);
+  }
+
+  governanceUnpause(): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.governanceUnpause);
+  }
+
+  paused(): Promise<boolean> {
+    return call<boolean>(this.contract.paused);
+  }
+
+  isAssetDisputed(tokenId: bigint): Promise<boolean> {
+    return call<boolean>(this.contract.isAssetDisputed, tokenId);
+  }
+
+  flagAnomaly(
+    target: string,
+    tokenId: bigint,
+    reason: string
+  ): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.flagAnomaly, target, tokenId, reason);
+  }
+
+  raiseDispute(
+    tokenId: bigint,
+    evidenceHash: string,
+    reason: string
+  ): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.raiseDispute, tokenId, evidenceHash, reason);
+  }
+
+  resolveDispute(
+    disputeId: bigint,
+    upheld: boolean,
+    reason: string
+  ): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.resolveDispute, disputeId, upheld, reason);
+  }
+
+  storeAuditReportHash(
+    reportHash: string
+  ): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.storeAuditReportHash, reportHash);
+  }
+
+  verifyOwnership(tokenId: bigint, wallet: string): Promise<boolean> {
+    return call<boolean>(this.contract.verifyOwnership, tokenId, wallet);
+  }
+
+  verifyAuthenticity(tokenId: bigint): Promise<boolean> {
+    return call<boolean>(this.contract.verifyAuthenticity, tokenId);
+  }
+
+  getCustodyHistoryLength(tokenId: bigint): Promise<bigint> {
+    return call<bigint>(this.contract.getCustodyHistoryLength, tokenId);
+  }
+
+  getCustodyRecord(
+    tokenId: bigint,
+    index: number
+  ): Promise<{ fromCustodian: string; toCustodian: string; operator: string; at: bigint }> {
+    return call(this.contract.getCustodyRecord, tokenId, index);
+  }
+
+  disputeCount(): Promise<bigint> {
+    return call<bigint>(this.contract.disputeCount);
+  }
+
+  getDispute(disputeId: bigint): Promise<{
+    tokenId: bigint;
+    raisedBy: string;
+    evidenceHash: string;
+    reason: string;
+    open: boolean;
+    upheld: boolean;
+    resolutionReason: string;
+    raisedAt: bigint;
+    resolvedAt: bigint;
+  }> {
+    return call(this.contract.getDispute, disputeId);
+  }
+
+  anomalyCount(): Promise<bigint> {
+    return call<bigint>(this.contract.anomalyCount);
+  }
+
+  getAnomaly(anomalyId: bigint): Promise<{ target: string; tokenId: bigint; flaggedBy: string; reason: string; at: bigint }> {
+    return call(this.contract.getAnomaly, anomalyId);
+  }
+
+  auditReportCount(): Promise<bigint> {
+    return call<bigint>(this.contract.auditReportCount);
+  }
+
+  getAuditReport(reportId: bigint): Promise<{ auditor: string; reportHash: string; at: bigint }> {
+    return call(this.contract.getAuditReport, reportId);
+  }
 }
 
 export function createAccessControlContract(
@@ -212,6 +371,95 @@ export function createAccessControlContract(
   signer: Signer
 ): SampraanAccessControlHandle {
   return new SampraanAccessControlHandle(address, getSampraanAccessControlABI(), signer);
+}
+
+export interface GovernanceProposalCore {
+  kind: bigint;
+  target: string;
+  role: string;
+  account: string;
+  tokenId: bigint;
+  reason: string;
+}
+
+export interface GovernanceProposalState {
+  createdAt: bigint;
+  approvals: bigint;
+  requiredApprovals: bigint;
+  executableAt: bigint;
+  executed: boolean;
+  cancelled: boolean;
+}
+
+export class SampraanGovernanceHandle {
+  private readonly contract: ContractLike;
+  constructor(address: string, abi: InterfaceAbi, signer: Signer) {
+    this.contract = bind(new Contract(address, abi, signer));
+  }
+
+  // Views
+  signerCount(): Promise<bigint> {
+    return call<bigint>(this.contract.signerCount);
+  }
+
+  isSigner(account: string): Promise<boolean> {
+    return call<boolean>(this.contract.isSigner, account);
+  }
+
+  quorumRequired(): Promise<bigint> {
+    return call<bigint>(this.contract.quorumRequired);
+  }
+
+  timelockDelaySeconds(): Promise<bigint> {
+    return call<bigint>(this.contract.timelockDelaySeconds);
+  }
+
+  proposalCount(): Promise<bigint> {
+    return call<bigint>(this.contract.proposalCount);
+  }
+
+  proposalCore(proposalId: bigint): Promise<GovernanceProposalCore> {
+    return call(this.contract.proposalCore, proposalId);
+  }
+
+  proposalState(proposalId: bigint): Promise<GovernanceProposalState> {
+    return call(this.contract.proposalState, proposalId);
+  }
+
+  proposalHasApproval(proposalId: bigint, signer: string): Promise<boolean> {
+    return call<boolean>(this.contract.proposalHasApproval, proposalId, signer);
+  }
+
+  // Mutations (all signer-gated on-chain)
+  propose(
+    kind: number,
+    target: string,
+    role: string,
+    account: string,
+    tokenId: bigint,
+    reason: string
+  ): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.propose, kind, target, role, account, tokenId, reason);
+  }
+
+  approve(proposalId: bigint, reason: string): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.approve, proposalId, reason);
+  }
+
+  cancel(proposalId: bigint, reason: string): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.cancel, proposalId, reason);
+  }
+
+  execute(proposalId: bigint): Promise<{ wait: (c?: number) => Promise<unknown> }> {
+    return call(this.contract.execute, proposalId);
+  }
+}
+
+export function createGovernanceContract(
+  address: string,
+  signer: Signer
+): SampraanGovernanceHandle {
+  return new SampraanGovernanceHandle(address, getSampraanGovernanceABI(), signer);
 }
 
 export function createIdentityRegistryContract(

@@ -110,16 +110,19 @@ d("DID challenge-response (LOOP 2)", () => {
 });
 
 d("Key lifecycle (LOOP 3)", () => {
-  it("rotated key cannot authenticate (challenge issuance fails with KEY_ROTATED)", async () => {
-    const rows = await (await getDb())!.select().from(didRecords).where(eq(didRecords.did, DEMO_DID)).limit(1);
-    const original = rows[0]?.keyStatus ?? "ACTIVE";
-    try {
-      await rotateDidKey(DEMO_DID);
-      const challenge = await createDidChallenge(DEMO_DID);
-      expect(challenge.ok).toBe(false);
-      if (!challenge.ok) expect(challenge.code).toBe("KEY_ROTATED");
-    } finally {
-      await setDidKeyStatus(DEMO_DID, original === "ACTIVE" ? "ACTIVE" : "ACTIVE");
+  it("rotated key generation cannot authenticate — new generation issues challenges bound to the NEW keyId", async () => {
+    // HARDENED SEMANTICS: rotation activates the NEXT key generation, so
+    // challenge issuance succeeds again — but every new challenge is bound
+    // to the new keyId, and any challenge issued for the pre-rotation
+    // generation fails verification (KEY_SUPERSEDED / CHALLENGE_INVALID).
+    // See did-hardening.test.ts for the full binding matrix.
+    const rotated = await rotateDidKey(DEMO_DID);
+    expect(rotated.ok).toBe(true);
+    const challenge = await createDidChallenge(DEMO_DID);
+    expect(challenge.ok).toBe(true);
+    if (challenge.ok && rotated.ok) {
+      expect(challenge.challenge.keyIdentifier).toBe(rotated.newKeyIdentifier);
+      expect(rotated.newKeyIdentifier).not.toBe(rotated.previousKeyIdentifier);
     }
   });
 

@@ -24,6 +24,7 @@ const ROOT_SOURCES = [
   "SampraanAccessControl.sol",
   "SampraanIdentityRegistry.sol",
   "SampraanAssetRegistry.sol",
+  "SampraanGovernance.sol",
 ] as const;
 
 interface SolcInput {
