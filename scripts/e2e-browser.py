@@ -74,7 +74,7 @@ with sync_playwright() as p:
 
     # ---------------- workspace surfaces ----------------
     labels_seen = body_after.lower()
-    for surface in ["command center", "identity", "asset", "audit", "governance"]:
+    for surface in ["secure workspace", "identity", "asset", "audit", "governance"]:
         check(f"workspace mentions '{surface}'", surface in labels_seen)
 
     # refresh + direct URL navigation

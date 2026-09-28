@@ -136,3 +136,6 @@ blockchain/network/generated.old/
 
 # Local DB credentials scratch file (dev-only, never commit)
 .tmp-db-creds.env
+
+# Local QA screenshots (browser verification artifacts)
+screenshots/
